@@ -25,3 +25,14 @@ This plugin can also control the system volume. The peer device can send a
 package with "requestVolume" set to true to ask for the current volume, or send
 a package with "setVolume" set to an integer in the range [0,100] to change it.
 
+macOS support is experimental and is not built by default. Configure with
+`-DWITH_MACOS_MEDIAREMOTE=ON` to enable it. The backend loads Apple's private
+MediaRemote framework at runtime with `dlopen`/`dlsym`; set
+`KDECONNECT_DISABLE_MACOS_MEDIAREMOTE=1` to force the safe fallback path. Missing
+frameworks or symbols degrade to a single safe "Now Playing" player with limited
+metadata from Music/Spotify AppleScript or an optional helper named by
+`KDECONNECT_MACOS_MEDIAREMOTE_HELPER` (JSON on stdout). MediaRemote is private
+API: controls/metadata may be gated by macOS entitlements, can no-op after OS
+updates, and may affect signing/notarization review. Seek remains disabled until
+the private command contract is verified.
+

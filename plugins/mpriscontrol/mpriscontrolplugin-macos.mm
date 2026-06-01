@@ -18,21 +18,37 @@
 #include <QBuffer>
 #include <QCryptographicHash>
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QDateTime>
 
 #include <cmath>
 #include <dlfcn.h>
-#include <memory>
 #include <algorithm>
 
 #import <Foundation/Foundation.h>
 
 K_PLUGIN_CLASS_WITH_JSON(MprisControlPlugin, "kdeconnect_mpriscontrol.json")
 
+struct NowPlayingInfo {
+    QString title;
+    QString artist;
+    QString album;
+    qlonglong length = -1;
+    qlonglong pos = 0;
+    bool hasPosition = false;
+    bool hasPlaybackRate = false;
+    double playbackRate = 0.0;
+    bool isPlaying = false;
+    bool hasDescriptiveMetadata = false;
+    bool hasUsefulMetadata = false;
+    QByteArray artworkBytes;
+    QString source;
+};
+
 namespace
 {
-const QString nowPlayingPlayer()
+QString nowPlayingPlayer()
 {
     return QStringLiteral("Now Playing");
 }
@@ -44,8 +60,21 @@ constexpr int commandNextTrack = 4;
 constexpr int commandPreviousTrack = 5;
 constexpr int pollIntervalMs = 1500;
 constexpr int nowPlayingTimeoutMs = 1000;
+constexpr int helperTimeoutMs = 500;
+constexpr int appleScriptTimeoutMs = 900;
+constexpr int processCleanupTimeoutMs = 100;
 constexpr qsizetype maxAlbumArtBytes = 5 * 1024 * 1024;
 constexpr double minimumPlayingRate = 0.01;
+
+const QString keyPlayer = QStringLiteral("player");
+const QString keyTitle = QStringLiteral("title");
+const QString keyArtist = QStringLiteral("artist");
+const QString keyAlbum = QStringLiteral("album");
+const QString keyAlbumArtUrl = QStringLiteral("albumArtUrl");
+const QString keyLength = QStringLiteral("length");
+const QString keyPos = QStringLiteral("pos");
+const QString keyIsPlaying = QStringLiteral("isPlaying");
+const QString keyPlaybackRate = QStringLiteral("playbackRate");
 
 template<typename T>
 T loadSymbol(void *handle, const char *name)
@@ -98,21 +127,6 @@ qlonglong secondsToMilliseconds(double seconds, qlonglong fallback = 0)
     return static_cast<qlonglong>(std::llround(seconds * 1000.0));
 }
 
-struct NowPlayingInfo {
-    QString title;
-    QString artist;
-    QString album;
-    qlonglong length = -1;
-    qlonglong pos = 0;
-    bool hasPosition = false;
-    bool hasPlaybackRate = false;
-    double playbackRate = 0.0;
-    bool isPlaying = false;
-    bool hasUsefulMetadata = false;
-    QByteArray artworkBytes;
-    QString source;
-};
-
 class MediaRemote
 {
 public:
@@ -163,26 +177,21 @@ public:
             return false;
         }
 
-        struct State {
-            Boolean playing = false;
-            bool answered = false;
-        };
-
-        auto state = std::make_shared<State>();
+        __block Boolean playing = false;
+        __block bool answered = false;
         dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
         m_getIsPlaying(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(Boolean isPlaying) {
-            state->playing = isPlaying;
-            state->answered = true;
+            playing = isPlaying;
+            answered = true;
             dispatch_semaphore_signal(semaphore);
         });
 
-        const long timeout = dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC));
-        if (timeout != 0 || !state->answered) {
+        if (dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, helperTimeoutMs * NSEC_PER_MSEC)) != 0 || !answered) {
             return false;
         }
 
         *ok = true;
-        return state->playing;
+        return playing;
     }
 
     CFStringRef keyTitle() const { return key(m_keyTitle); }
@@ -275,26 +284,16 @@ NowPlayingInfo readNowPlayingInfo(CFDictionaryRef info)
     }
     result.artworkBytes = cfDataToByteArray(value(MediaRemote::self().keyArtworkData()));
 
-    result.hasUsefulMetadata = !result.title.isEmpty() || !result.artist.isEmpty() || !result.album.isEmpty() || result.length >= 0 || result.hasPosition
-        || result.hasPlaybackRate || !result.artworkBytes.isEmpty();
+    result.hasDescriptiveMetadata = !result.title.isEmpty() || !result.artist.isEmpty() || !result.album.isEmpty() || result.length >= 0 || result.hasPosition
+        || !result.artworkBytes.isEmpty();
+    result.hasUsefulMetadata = result.hasDescriptiveMetadata || result.hasPlaybackRate;
+    if (!result.hasDescriptiveMetadata && result.hasPlaybackRate && result.isPlaying) {
+        result.title = nowPlayingPlayer();
+    }
     if (result.hasUsefulMetadata) {
         result.source = QStringLiteral("MediaRemote");
     }
     return result;
-}
-
-void mergeNowPlaying(NowPlayingInfo &target, const NowPlayingInfo &fallback)
-{
-    if (!fallback.hasUsefulMetadata) {
-        return;
-    }
-    if (target.hasUsefulMetadata) {
-        if (target.hasPlaybackRate && !target.isPlaying && fallback.hasPlaybackRate && fallback.isPlaying) {
-            target = fallback;
-        }
-        return;
-    }
-    target = fallback;
 }
 
 NowPlayingInfo runAppleScript(const QString &script, const QString &source)
@@ -304,9 +303,9 @@ NowPlayingInfo runAppleScript(const QString &script, const QString &source)
     process.setProgram(QStringLiteral("/usr/bin/osascript"));
     process.setArguments({QStringLiteral("-l"), QStringLiteral("JavaScript"), QStringLiteral("-e"), script});
     process.start();
-    if (!process.waitForFinished(900) || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+    if (!process.waitForFinished(appleScriptTimeoutMs) || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
         process.kill();
-        process.waitForFinished(100);
+        process.waitForFinished(processCleanupTimeoutMs);
         return result;
     }
 
@@ -316,24 +315,24 @@ NowPlayingInfo runAppleScript(const QString &script, const QString &source)
     }
 
     const QJsonObject object = document.object();
-    result.title = object.value(QStringLiteral("title")).toString();
-    result.artist = object.value(QStringLiteral("artist")).toString();
-    result.album = object.value(QStringLiteral("album")).toString();
-    result.length = object.value(QStringLiteral("length")).toInteger(-1);
-    result.pos = object.value(QStringLiteral("pos")).toInteger(0);
-    result.hasPosition = object.contains(QStringLiteral("pos"));
-    result.hasPlaybackRate = object.contains(QStringLiteral("isPlaying"));
-    result.playbackRate = object.value(QStringLiteral("playbackRate")).toDouble(object.value(QStringLiteral("isPlaying")).toBool(false) ? 1.0 : 0.0);
-    result.isPlaying = object.value(QStringLiteral("isPlaying")).toBool(false);
-    result.hasUsefulMetadata = !result.title.isEmpty() || !result.artist.isEmpty() || !result.album.isEmpty() || result.length >= 0 || result.hasPosition
-        || result.hasPlaybackRate;
+    result.title = object.value(keyTitle).toString();
+    result.artist = object.value(keyArtist).toString();
+    result.album = object.value(keyAlbum).toString();
+    result.length = object.value(keyLength).toInteger(-1);
+    result.pos = object.value(keyPos).toInteger(0);
+    result.hasPosition = object.contains(keyPos);
+    result.hasPlaybackRate = object.contains(keyIsPlaying);
+    result.playbackRate = object.value(keyPlaybackRate).toDouble(object.value(keyIsPlaying).toBool(false) ? 1.0 : 0.0);
+    result.isPlaying = object.value(keyIsPlaying).toBool(false);
+    result.hasDescriptiveMetadata = !result.title.isEmpty() || !result.artist.isEmpty() || !result.album.isEmpty() || result.length >= 0 || result.hasPosition;
+    result.hasUsefulMetadata = result.hasDescriptiveMetadata || result.hasPlaybackRate;
     if (result.hasUsefulMetadata) {
         result.source = object.value(QStringLiteral("source")).toString(source);
     }
     return result;
 }
 
-NowPlayingInfo queryAppleScriptFallbacks()
+NowPlayingInfo queryAppleScriptFallbacks(const QString &preferredSource)
 {
     static const QString script = QStringLiteral(R"JS(
 function read(appName, durationMultiplier) {
@@ -342,7 +341,8 @@ function read(appName, durationMultiplier) {
     app.includeStandardAdditions = true;
     if (!app.running()) return null;
     const state = String(app.playerState ? app.playerState() : '');
-    if (state.toLowerCase() !== 'playing') return null;
+    const stateLower = state.toLowerCase();
+    if (stateLower !== 'playing' && stateLower !== 'paused') return null;
     const track = app.currentTrack();
     const duration = Number(track.duration ? track.duration() : 0);
     const position = Number(app.playerPosition ? app.playerPosition() : 0);
@@ -352,8 +352,8 @@ function read(appName, durationMultiplier) {
       album: String(track.album ? track.album() : ''),
       length: isFinite(duration) && duration > 0 ? Math.round(duration * durationMultiplier) : -1,
       pos: isFinite(position) && position > 0 ? Math.round(position * 1000) : 0,
-      playbackRate: state.toLowerCase() === 'playing' ? 1 : 0,
-      isPlaying: state.toLowerCase() === 'playing',
+      playbackRate: stateLower === 'playing' ? 1 : 0,
+      isPlaying: stateLower === 'playing',
       source: 'AppleScript/' + appName
     };
     if (!item.title && !item.artist && !item.album && item.length < 0 && item.pos <= 0) return null;
@@ -361,13 +361,19 @@ function read(appName, durationMultiplier) {
   } catch (e) { return null; }
 }
 const candidates = [read('Music', 1000), read('Spotify', 1)].filter(Boolean);
-JSON.stringify(candidates[0] || {});
+const playing = candidates.filter(item => item.isPlaying);
+const preferred = %1;
+const preferredPaused = candidates.filter(item => item.source === preferred);
+JSON.stringify(playing[0] || preferredPaused[0] || candidates[0] || {});
 )JS");
-    return runAppleScript(script, QStringLiteral("AppleScript"));
+    const QString encodedPreferredArray = QString::fromUtf8(QJsonDocument(QJsonArray{preferredSource}).toJson(QJsonDocument::Compact));
+    const QString encodedPreferred = encodedPreferredArray.mid(1, encodedPreferredArray.size() - 2);
+    return runAppleScript(script.arg(encodedPreferred), QStringLiteral("AppleScript"));
 }
 
 QByteArray readMusicArtworkFallback()
 {
+    static bool reportedFailure = false;
     QTemporaryFile file;
     if (!file.open()) {
         return {};
@@ -395,15 +401,22 @@ on run argv
 end run
 )AS"), path});
     process.start();
-    if (!process.waitForFinished(900) || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
-        qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Music artwork fallback failed" << process.exitCode() << QString::fromUtf8(process.readAllStandardError()).trimmed();
+    if (!process.waitForFinished(appleScriptTimeoutMs) || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        if (!reportedFailure) {
+            qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Music artwork fallback failed" << process.exitCode()
+                                                    << QString::fromUtf8(process.readAllStandardError()).trimmed();
+            reportedFailure = true;
+        }
         process.kill();
-        process.waitForFinished(100);
+        process.waitForFinished(processCleanupTimeoutMs);
         return {};
     }
 
     if (!file.open() || file.size() <= 0 || file.size() > maxAlbumArtBytes) {
-        qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Music artwork fallback empty or too large" << file.size();
+        if (!reportedFailure) {
+            qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Music artwork fallback empty or too large" << file.size();
+            reportedFailure = true;
+        }
         return {};
     }
     return file.readAll();
@@ -411,6 +424,7 @@ end run
 
 QByteArray readSpotifyArtworkFallback()
 {
+    static bool reportedFailure = false;
     static const QString script = QStringLiteral(R"JS(
 try {
   const app = Application('Spotify');
@@ -423,11 +437,14 @@ try {
     osascript.setProgram(QStringLiteral("/usr/bin/osascript"));
     osascript.setArguments({QStringLiteral("-l"), QStringLiteral("JavaScript"), QStringLiteral("-e"), script});
     osascript.start();
-    if (!osascript.waitForFinished(900) || osascript.exitStatus() != QProcess::NormalExit || osascript.exitCode() != 0) {
-        qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Spotify artwork URL fallback failed" << osascript.exitCode()
-                                                << QString::fromUtf8(osascript.readAllStandardError()).trimmed();
+    if (!osascript.waitForFinished(appleScriptTimeoutMs) || osascript.exitStatus() != QProcess::NormalExit || osascript.exitCode() != 0) {
+        if (!reportedFailure) {
+            qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Spotify artwork URL fallback failed" << osascript.exitCode()
+                                                    << QString::fromUtf8(osascript.readAllStandardError()).trimmed();
+            reportedFailure = true;
+        }
         osascript.kill();
-        osascript.waitForFinished(100);
+        osascript.waitForFinished(processCleanupTimeoutMs);
         return {};
     }
 
@@ -448,15 +465,21 @@ try {
                        url});
     curl.start();
     if (!curl.waitForFinished(2500) || curl.exitStatus() != QProcess::NormalExit || curl.exitCode() != 0) {
-        qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Spotify artwork download failed" << curl.exitCode() << QString::fromUtf8(curl.readAllStandardError()).trimmed();
+        if (!reportedFailure) {
+            qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Spotify artwork download failed" << curl.exitCode() << QString::fromUtf8(curl.readAllStandardError()).trimmed();
+            reportedFailure = true;
+        }
         curl.kill();
-        curl.waitForFinished(100);
+        curl.waitForFinished(processCleanupTimeoutMs);
         return {};
     }
 
     const QByteArray artwork = curl.readAllStandardOutput();
     if (artwork.isEmpty() || artwork.size() > maxAlbumArtBytes) {
-        qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Spotify artwork download empty or too large" << artwork.size();
+        if (!reportedFailure) {
+            qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Spotify artwork download empty or too large" << artwork.size();
+            reportedFailure = true;
+        }
         return {};
     }
     return artwork;
@@ -485,8 +508,9 @@ NowPlayingInfo queryPlatformHelperFallback()
     QProcess process;
     process.setProgram(program);
     process.start();
-    if (!process.waitForFinished(500) || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+    if (!process.waitForFinished(helperTimeoutMs) || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
         process.kill();
+        process.waitForFinished(processCleanupTimeoutMs);
         return result;
     }
 
@@ -496,21 +520,24 @@ NowPlayingInfo queryPlatformHelperFallback()
     }
 
     const QJsonObject object = document.object();
-    result.title = object.value(QStringLiteral("title")).toString();
-    result.artist = object.value(QStringLiteral("artist")).toString();
-    result.album = object.value(QStringLiteral("album")).toString();
-    result.length = object.value(QStringLiteral("length")).toInteger(object.value(QStringLiteral("duration")).toDouble(-0.001) >= 0
+    result.title = object.value(keyTitle).toString();
+    result.artist = object.value(keyArtist).toString();
+    result.album = object.value(keyAlbum).toString();
+    result.length = object.value(keyLength).toInteger(object.value(QStringLiteral("duration")).toDouble(-0.001) >= 0
                                                                   ? static_cast<qint64>(object.value(QStringLiteral("duration")).toDouble() * 1000.0)
                                                                   : -1);
-    result.pos = object.value(QStringLiteral("pos")).toInteger(object.value(QStringLiteral("elapsed")).toDouble(0.0) > 0
+    result.pos = object.value(keyPos).toInteger(object.value(QStringLiteral("elapsed")).toDouble(0.0) > 0
                                                             ? static_cast<qint64>(object.value(QStringLiteral("elapsed")).toDouble() * 1000.0)
                                                             : 0);
-    result.hasPosition = object.contains(QStringLiteral("pos")) || object.contains(QStringLiteral("elapsed"));
-    result.hasPlaybackRate = object.contains(QStringLiteral("isPlaying"));
-    result.playbackRate = object.value(QStringLiteral("playbackRate")).toDouble(object.value(QStringLiteral("isPlaying")).toBool(false) ? 1.0 : 0.0);
-    result.isPlaying = object.value(QStringLiteral("isPlaying")).toBool(false);
-    result.hasUsefulMetadata = !result.title.isEmpty() || !result.artist.isEmpty() || !result.album.isEmpty() || result.length >= 0 || result.hasPosition
-        || result.hasPlaybackRate;
+    result.hasPosition = object.contains(keyPos) || object.contains(QStringLiteral("elapsed"));
+    result.hasPlaybackRate = object.contains(keyIsPlaying);
+    result.playbackRate = object.value(keyPlaybackRate).toDouble(object.value(keyIsPlaying).toBool(false) ? 1.0 : 0.0);
+    result.isPlaying = object.value(keyIsPlaying).toBool(false);
+    result.hasDescriptiveMetadata = !result.title.isEmpty() || !result.artist.isEmpty() || !result.album.isEmpty() || result.length >= 0 || result.hasPosition;
+    result.hasUsefulMetadata = result.hasDescriptiveMetadata || result.hasPlaybackRate;
+    if (!result.hasDescriptiveMetadata && result.hasPlaybackRate && result.isPlaying) {
+        result.title = nowPlayingPlayer();
+    }
     if (result.hasUsefulMetadata) {
         result.source = QStringLiteral("platform-helper");
     }
@@ -525,21 +552,31 @@ NowPlayingInfo fallbackNowPlayingInfo(bool hasLastKnownIsPlaying, bool lastKnown
     result.isPlaying = hasLastKnownIsPlaying ? lastKnownIsPlaying : false;
     result.playbackRate = result.isPlaying ? 1.0 : 0.0;
     result.hasUsefulMetadata = true;
+    result.hasDescriptiveMetadata = true;
     result.source = QStringLiteral("safe-default");
     return result;
 }
 
-NowPlayingInfo queryFallbackCascade(bool hasLastKnownIsPlaying, bool lastKnownIsPlaying)
+NowPlayingInfo queryMediaRemotePlaybackStateFallback()
 {
-    NowPlayingInfo nowPlaying = queryAppleScriptFallbacks();
-    if (!nowPlaying.hasUsefulMetadata) {
-        mergeNowPlaying(nowPlaying, queryPlatformHelperFallback());
+    bool ok = false;
+    const bool isPlaying = MediaRemote::self().queryIsPlaying(&ok);
+    if (!ok || !isPlaying) {
+        return {};
     }
-    if (!nowPlaying.hasUsefulMetadata) {
-        mergeNowPlaying(nowPlaying, fallbackNowPlayingInfo(hasLastKnownIsPlaying, lastKnownIsPlaying));
-    }
-    return nowPlaying;
+
+    return fallbackNowPlayingInfo(true, true);
 }
+
+NowPlayingInfo queryGenericFallback()
+{
+    NowPlayingInfo genericFallback = queryMediaRemotePlaybackStateFallback();
+    if (!genericFallback.hasUsefulMetadata) {
+        genericFallback = queryPlatformHelperFallback();
+    }
+    return genericFallback;
+}
+
 }
 
 MprisControlPlugin::MprisControlPlugin(QObject *parent, const QVariantList &args)
@@ -551,15 +588,11 @@ MprisControlPlugin::MprisControlPlugin(QObject *parent, const QVariantList &args
     sendPlayerList();
     sendNowPlaying(true);
 
-    if (!MediaRemote::self().canReadNowPlayingInfo()) {
-        return;
-    }
-
     m_pollTimer = new QTimer(this);
     m_pollTimer->setInterval(pollIntervalMs);
     connect(m_pollTimer, &QTimer::timeout, this, &MprisControlPlugin::pollNowPlaying);
     m_pollTimer->start();
-    qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Polling MediaRemote now-playing metadata every" << pollIntervalMs << "ms";
+    qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Polling macOS now-playing metadata every" << pollIntervalMs << "ms";
 }
 
 void MprisControlPlugin::receivePacket(const NetworkPacket &np)
@@ -568,7 +601,7 @@ void MprisControlPlugin::receivePacket(const NetworkPacket &np)
         return;
     }
 
-    const QString player = np.get<QString>(QStringLiteral("player"));
+    const QString player = np.get<QString>(keyPlayer);
     const bool knownPlayer = player.isEmpty() || player == nowPlayingPlayer();
 
     if (np.get<bool>(QStringLiteral("requestPlayerList"))) {
@@ -582,53 +615,14 @@ void MprisControlPlugin::receivePacket(const NetworkPacket &np)
         return;
     }
 
-    if (np.has(QStringLiteral("albumArtUrl"))) {
-        sendAlbumArt(np.get<QString>(QStringLiteral("albumArtUrl")));
+    if (np.has(keyAlbumArtUrl)) {
+        sendAlbumArt(np.get<QString>(keyAlbumArtUrl));
         return;
     }
 
     bool handledAction = false;
     if (np.has(QStringLiteral("action"))) {
-        const QString action = np.get<QString>(QStringLiteral("action"));
-        if (action == QStringLiteral("Play")) {
-            MediaRemote::self().sendCommand(commandPlay);
-            m_lastKnownIsPlaying = true;
-            m_hasLastKnownIsPlaying = true;
-            m_lastPlaybackRate = 1.0;
-            if (m_hasLastPosition) {
-                m_lastPositionSampleTime = QDateTime::currentMSecsSinceEpoch();
-            }
-            handledAction = true;
-        } else if (action == QStringLiteral("Pause") || action == QStringLiteral("Stop")) {
-            QVariantMap body = defaultNowPlayingBody();
-            estimatePlaybackProgress(body);
-            m_lastPosition = body.value(QStringLiteral("pos")).toLongLong();
-            m_lastPositionSampleTime = QDateTime::currentMSecsSinceEpoch();
-            MediaRemote::self().sendCommand(commandPause);
-            m_lastKnownIsPlaying = false;
-            m_hasLastKnownIsPlaying = true;
-            m_lastPlaybackRate = 0.0;
-            handledAction = true;
-        } else if (action == QStringLiteral("PlayPause")) {
-            const bool willPlay = m_hasLastKnownIsPlaying ? !m_lastKnownIsPlaying : true;
-            QVariantMap body = defaultNowPlayingBody();
-            estimatePlaybackProgress(body);
-            m_lastPosition = body.value(QStringLiteral("pos")).toLongLong();
-            m_lastPositionSampleTime = QDateTime::currentMSecsSinceEpoch();
-            MediaRemote::self().sendCommand(commandTogglePlayPause);
-            m_lastKnownIsPlaying = willPlay;
-            m_hasLastKnownIsPlaying = true;
-            m_lastPlaybackRate = m_lastKnownIsPlaying ? 1.0 : 0.0;
-            handledAction = true;
-        } else if (action == QStringLiteral("Next")) {
-            MediaRemote::self().sendCommand(commandNextTrack);
-            m_hasLastPosition = false;
-            handledAction = true;
-        } else if (action == QStringLiteral("Previous")) {
-            MediaRemote::self().sendCommand(commandPreviousTrack);
-            m_hasLastPosition = false;
-            handledAction = true;
-        }
+        handledAction = handleAction(np.get<QString>(QStringLiteral("action")));
     }
 
     // MediaRemote has a private SeekToPlaybackPosition command, but this backend has no locally verified,
@@ -644,6 +638,68 @@ void MprisControlPlugin::receivePacket(const NetworkPacket &np)
         sendPlayerList();
         sendNowPlaying(true);
     }
+}
+
+bool MprisControlPlugin::handleAction(const QString &action)
+{
+    auto sendCommand = [this](int command) {
+        const bool sent = MediaRemote::self().sendCommand(command);
+        if (!sent && !m_reportedCommandUnavailable) {
+            qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Ignoring media command: MediaRemote command symbol unavailable";
+            m_reportedCommandUnavailable = true;
+        }
+        return sent;
+    };
+
+    auto freezeProgress = [this]() {
+        QVariantMap body = defaultNowPlayingBody();
+        estimatePlaybackProgress(body);
+        m_lastPosition = body.value(keyPos).toLongLong();
+        m_lastPositionSampleTime = QDateTime::currentMSecsSinceEpoch();
+    };
+
+    if (action == QStringLiteral("Play")) {
+        sendCommand(commandPlay);
+        m_lastKnownIsPlaying = true;
+        m_hasLastKnownIsPlaying = true;
+        m_lastPlaybackRate = 1.0;
+        if (m_hasLastPosition) {
+            m_lastPositionSampleTime = QDateTime::currentMSecsSinceEpoch();
+        }
+        return true;
+    }
+
+    if (action == QStringLiteral("Pause") || action == QStringLiteral("Stop")) {
+        freezeProgress();
+        sendCommand(commandPause);
+        m_lastKnownIsPlaying = false;
+        m_hasLastKnownIsPlaying = true;
+        m_lastPlaybackRate = 0.0;
+        return true;
+    }
+
+    if (action == QStringLiteral("PlayPause")) {
+        freezeProgress();
+        sendCommand(commandTogglePlayPause);
+        m_lastKnownIsPlaying = m_hasLastKnownIsPlaying ? !m_lastKnownIsPlaying : true;
+        m_hasLastKnownIsPlaying = true;
+        m_lastPlaybackRate = m_lastKnownIsPlaying ? 1.0 : 0.0;
+        return true;
+    }
+
+    if (action == QStringLiteral("Next")) {
+        sendCommand(commandNextTrack);
+        m_hasLastPosition = false;
+        return true;
+    }
+
+    if (action == QStringLiteral("Previous")) {
+        sendCommand(commandPreviousTrack);
+        m_hasLastPosition = false;
+        return true;
+    }
+
+    return false;
 }
 
 void MprisControlPlugin::sendPlayerList()
@@ -670,8 +726,8 @@ bool MprisControlPlugin::sendAlbumArt(const QString &requestedAlbumArtUrl)
 
     NetworkPacket answer(PACKET_TYPE_MPRIS);
     answer.set(QStringLiteral("transferringAlbumArt"), true);
-    answer.set(QStringLiteral("player"), nowPlayingPlayer());
-    answer.set(QStringLiteral("albumArtUrl"), requestedAlbumArtUrl);
+    answer.set(keyPlayer, nowPlayingPlayer());
+    answer.set(keyAlbumArtUrl, requestedAlbumArtUrl);
     answer.setPayload(buffer, buffer->size());
     qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Sending album art payload" << requestedAlbumArtUrl << buffer->size();
     sendPacket(answer);
@@ -691,15 +747,15 @@ void MprisControlPlugin::pollNowPlaying()
 QVariantMap MprisControlPlugin::defaultNowPlayingBody() const
 {
     QVariantMap body;
-    body[QStringLiteral("player")] = nowPlayingPlayer();
+    body[keyPlayer] = nowPlayingPlayer();
     body[QStringLiteral("title")] = QString();
     body[QStringLiteral("artist")] = QString();
     body[QStringLiteral("album")] = QString();
-    body[QStringLiteral("albumArtUrl")] = QString();
+    body[keyAlbumArtUrl] = QString();
     body[QStringLiteral("url")] = QUrl();
-    body[QStringLiteral("length")] = -1;
-    body[QStringLiteral("pos")] = 0;
-    body[QStringLiteral("isPlaying")] = m_hasLastKnownIsPlaying ? m_lastKnownIsPlaying : false;
+    body[keyLength] = -1;
+    body[keyPos] = 0;
+    body[keyIsPlaying] = m_hasLastKnownIsPlaying ? m_lastKnownIsPlaying : false;
     const bool canSendCommands = MediaRemote::self().canSendCommands();
     body[QStringLiteral("canPause")] = canSendCommands;
     body[QStringLiteral("canPlay")] = canSendCommands;
@@ -707,6 +763,53 @@ QVariantMap MprisControlPlugin::defaultNowPlayingBody() const
     body[QStringLiteral("canGoPrevious")] = canSendCommands;
     body[QStringLiteral("canSeek")] = false;
     return body;
+}
+
+void MprisControlPlugin::rememberSupportedSource(const NowPlayingInfo &nowPlaying)
+{
+    if (nowPlaying.source.startsWith(QLatin1String("AppleScript/")) && nowPlaying.hasPlaybackRate && nowPlaying.isPlaying) {
+        m_lastSupportedSource = nowPlaying.source;
+    }
+}
+
+NowPlayingInfo MprisControlPlugin::selectFallbackNowPlaying(const NowPlayingInfo &supportedApp, const NowPlayingInfo &genericFallback) const
+{
+    if (supportedApp.hasUsefulMetadata && supportedApp.hasPlaybackRate && supportedApp.isPlaying) {
+        return supportedApp;
+    }
+
+    if (genericFallback.hasUsefulMetadata && genericFallback.hasPlaybackRate && genericFallback.isPlaying) {
+        return genericFallback;
+    }
+
+    if (supportedApp.hasUsefulMetadata) {
+        if (m_lastSupportedSource.isEmpty() || supportedApp.source == m_lastSupportedSource) {
+            return supportedApp;
+        }
+    }
+
+    if (genericFallback.hasUsefulMetadata) {
+        return genericFallback;
+    }
+
+    return fallbackNowPlayingInfo(m_hasLastKnownIsPlaying, m_lastKnownIsPlaying);
+}
+
+void MprisControlPlugin::applyNowPlayingInfo(QVariantMap &body, const NowPlayingInfo &nowPlaying, qint64 sampleTime)
+{
+    rememberSupportedSource(nowPlaying);
+    updateAlbumArt(nowPlaying.artworkBytes.isEmpty() ? readAppleScriptArtworkFallback(nowPlaying.source) : nowPlaying.artworkBytes);
+    body[keyTitle] = nowPlaying.title;
+    body[keyArtist] = nowPlaying.artist;
+    body[keyAlbum] = nowPlaying.album;
+    body[keyLength] = nowPlaying.length;
+    body[keyPos] = nowPlaying.pos;
+    updatePlaybackProgress(nowPlaying.hasPosition, nowPlaying.pos, nowPlaying.hasPlaybackRate, nowPlaying.playbackRate, sampleTime);
+    if (nowPlaying.hasPlaybackRate) {
+        m_lastKnownIsPlaying = nowPlaying.isPlaying;
+        m_hasLastKnownIsPlaying = true;
+        body[keyIsPlaying] = nowPlaying.isPlaying;
+    }
 }
 
 void MprisControlPlugin::updateAlbumArt(const QByteArray &artworkBytes)
@@ -769,11 +872,11 @@ void MprisControlPlugin::estimatePlaybackProgress(QVariantMap &body) const
         }
     }
 
-    const qlonglong length = body.value(QStringLiteral("length"), -1).toLongLong();
+    const qlonglong length = body.value(keyLength, -1).toLongLong();
     if (length >= 0) {
         position = std::min(position, length);
     }
-    body[QStringLiteral("pos")] = std::max<qlonglong>(0, position);
+    body[keyPos] = std::max<qlonglong>(0, position);
 }
 
 void MprisControlPlugin::requestNowPlaying(bool force)
@@ -784,21 +887,10 @@ void MprisControlPlugin::requestNowPlaying(bool force)
     }
 
     if (!MediaRemote::self().canReadNowPlayingInfo()) {
-        const NowPlayingInfo nowPlaying = queryFallbackCascade(m_hasLastKnownIsPlaying, m_lastKnownIsPlaying);
+        const NowPlayingInfo nowPlaying = selectFallbackNowPlaying(queryAppleScriptFallbacks(m_lastSupportedSource), queryGenericFallback());
         const qint64 sampleTime = QDateTime::currentMSecsSinceEpoch();
         QVariantMap body = defaultNowPlayingBody();
-        updateAlbumArt(readAppleScriptArtworkFallback(nowPlaying.source));
-        body[QStringLiteral("title")] = nowPlaying.title;
-        body[QStringLiteral("artist")] = nowPlaying.artist;
-        body[QStringLiteral("album")] = nowPlaying.album;
-        body[QStringLiteral("length")] = nowPlaying.length;
-        body[QStringLiteral("pos")] = nowPlaying.pos;
-        updatePlaybackProgress(nowPlaying.hasPosition, nowPlaying.pos, nowPlaying.hasPlaybackRate, nowPlaying.playbackRate, sampleTime);
-        if (nowPlaying.hasPlaybackRate) {
-            m_lastKnownIsPlaying = nowPlaying.isPlaying;
-            m_hasLastKnownIsPlaying = true;
-            body[QStringLiteral("isPlaying")] = nowPlaying.isPlaying;
-        }
+        applyNowPlayingInfo(body, nowPlaying, sampleTime);
         sendNowPlayingBody(body, force);
         return;
     }
@@ -818,8 +910,10 @@ void MprisControlPlugin::requestNowPlaying(bool force)
             qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "MediaRemote now-playing metadata request timed out";
             m_reportedNowPlayingTimeout = true;
         }
-        updateAlbumArt({});
-        sendNowPlayingBody(defaultNowPlayingBody(), forceSend);
+        const NowPlayingInfo fallback = selectFallbackNowPlaying(queryAppleScriptFallbacks(m_lastSupportedSource), queryGenericFallback());
+        QVariantMap body = defaultNowPlayingBody();
+        applyNowPlayingInfo(body, fallback, QDateTime::currentMSecsSinceEpoch());
+        sendNowPlayingBody(body, forceSend);
     });
 
     MediaRemote::self().getNowPlayingInfoAsync(^(CFDictionaryRef info) {
@@ -827,15 +921,28 @@ void MprisControlPlugin::requestNowPlaying(bool force)
             return;
         }
 
-        const bool hasLastKnownIsPlaying = guard ? guard->m_hasLastKnownIsPlaying : false;
-        const bool lastKnownIsPlaying = guard ? guard->m_lastKnownIsPlaying : false;
         NowPlayingInfo nowPlaying;
         const qint64 sampleTime = QDateTime::currentMSecsSinceEpoch();
         @autoreleasepool {
             nowPlaying = readNowPlayingInfo(info);
         }
         if (!nowPlaying.hasUsefulMetadata) {
-            mergeNowPlaying(nowPlaying, queryFallbackCascade(hasLastKnownIsPlaying, lastKnownIsPlaying));
+            QMetaObject::invokeMethod(guard.data(), [guard, requestId, sampleTime]() {
+                if (!guard) {
+                    return;
+                }
+                if (!guard->m_nowPlayingRequestInFlight || requestId != guard->m_nowPlayingRequestId) {
+                    return;
+                }
+                const NowPlayingInfo fallback = guard->selectFallbackNowPlaying(queryAppleScriptFallbacks(guard->m_lastSupportedSource), queryGenericFallback());
+                guard->m_nowPlayingRequestInFlight = false;
+                const bool forceSend = guard->m_forceSendAfterNowPlayingReply;
+                guard->m_forceSendAfterNowPlayingReply = false;
+                QVariantMap body = guard->defaultNowPlayingBody();
+                guard->applyNowPlayingInfo(body, fallback, sampleTime);
+                guard->sendNowPlayingBody(body, forceSend);
+            }, Qt::QueuedConnection);
+            return;
         }
 
         QMetaObject::invokeMethod(guard.data(), [guard, requestId, nowPlaying, sampleTime]() {
@@ -851,29 +958,10 @@ void MprisControlPlugin::requestNowPlaying(bool force)
             guard->m_forceSendAfterNowPlayingReply = false;
 
             QVariantMap body = guard->defaultNowPlayingBody();
-            if (nowPlaying.hasUsefulMetadata) {
-                guard->updateAlbumArt(nowPlaying.artworkBytes.isEmpty() ? readAppleScriptArtworkFallback(nowPlaying.source) : nowPlaying.artworkBytes);
-                body[QStringLiteral("title")] = nowPlaying.title;
-                body[QStringLiteral("artist")] = nowPlaying.artist;
-                body[QStringLiteral("album")] = nowPlaying.album;
-                body[QStringLiteral("length")] = nowPlaying.length;
-                body[QStringLiteral("pos")] = nowPlaying.pos;
-                guard->updatePlaybackProgress(nowPlaying.hasPosition, nowPlaying.pos, nowPlaying.hasPlaybackRate, nowPlaying.playbackRate, sampleTime);
-                if (nowPlaying.hasPlaybackRate) {
-                    guard->m_lastKnownIsPlaying = nowPlaying.isPlaying;
-                    guard->m_hasLastKnownIsPlaying = true;
-                    body[QStringLiteral("isPlaying")] = nowPlaying.isPlaying;
-                }
-                if (!guard->m_reportedNowPlayingInfo && nowPlaying.source != QStringLiteral("safe-default")) {
-                    qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Now-playing metadata available from" << nowPlaying.source;
-                    guard->m_reportedNowPlayingInfo = true;
-                }
-            } else {
-                guard->updateAlbumArt({});
-                if (!guard->m_reportedEmptyNowPlayingInfo) {
-                    qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "MediaRemote now-playing metadata empty; using safe defaults";
-                    guard->m_reportedEmptyNowPlayingInfo = true;
-                }
+            guard->applyNowPlayingInfo(body, nowPlaying, sampleTime);
+            if (!guard->m_reportedNowPlayingInfo && nowPlaying.source != QStringLiteral("safe-default")) {
+                qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Now-playing metadata available from" << nowPlaying.source;
+                guard->m_reportedNowPlayingInfo = true;
             }
 
             guard->sendNowPlayingBody(body, forceSend);
@@ -883,7 +971,7 @@ void MprisControlPlugin::requestNowPlaying(bool force)
 
 void MprisControlPlugin::sendNowPlayingBody(QVariantMap body, bool force)
 {
-    body[QStringLiteral("albumArtUrl")] = m_albumArtUrl;
+    body[keyAlbumArtUrl] = m_albumArtUrl;
     body[QStringLiteral("supportAlbumArtPayload")] = true;
     estimatePlaybackProgress(body);
     if (!force && m_hasLastNowPlayingBody && body == m_lastNowPlayingBody) {

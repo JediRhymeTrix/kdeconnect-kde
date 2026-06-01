@@ -14,6 +14,7 @@
 #include <QVariantMap>
 
 class QTimer;
+struct NowPlayingInfo;
 
 #define PACKET_TYPE_MPRIS QStringLiteral("kdeconnect.mpris")
 
@@ -34,6 +35,10 @@ private:
     void sendNowPlayingBody(QVariantMap body, bool force);
     bool sendAlbumArt(const QString &requestedAlbumArtUrl);
     QVariantMap defaultNowPlayingBody() const;
+    bool handleAction(const QString &action);
+    void rememberSupportedSource(const NowPlayingInfo &nowPlaying);
+    NowPlayingInfo selectFallbackNowPlaying(const NowPlayingInfo &supportedApp, const NowPlayingInfo &genericFallback) const;
+    void applyNowPlayingInfo(QVariantMap &body, const NowPlayingInfo &nowPlaying, qint64 sampleTime);
     void updateAlbumArt(const QByteArray &artworkBytes);
     void updatePlaybackProgress(bool hasPosition, qlonglong position, bool hasPlaybackRate, double playbackRate, qint64 sampleTime);
     void estimatePlaybackProgress(QVariantMap &body) const;
@@ -43,10 +48,10 @@ private:
     bool m_hasLastNowPlayingBody = false;
     bool m_nowPlayingRequestInFlight = false;
     bool m_forceSendAfterNowPlayingReply = false;
-    bool m_reportedEmptyNowPlayingInfo = false;
     bool m_reportedNowPlayingInfo = false;
     bool m_reportedNowPlayingTimeout = false;
     bool m_reportedSeekUnsupported = false;
+    bool m_reportedCommandUnavailable = false;
     bool m_hasLastPosition = false;
     int m_nowPlayingRequestId = 0;
     qlonglong m_lastPosition = 0;
@@ -56,6 +61,7 @@ private:
     QByteArray m_albumArtBytes;
     QByteArray m_albumArtHash;
     QString m_albumArtUrl;
+    QString m_lastSupportedSource;
     QVariantMap m_lastNowPlayingBody;
     QTimer *m_pollTimer = nullptr;
 };
