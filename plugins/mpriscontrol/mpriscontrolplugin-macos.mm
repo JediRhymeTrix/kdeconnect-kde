@@ -13,7 +13,10 @@
 #include <QMetaObject>
 #include <QPointer>
 #include <QProcess>
+#include <QTemporaryFile>
 #include <QTimer>
+#include <QBuffer>
+#include <QCryptographicHash>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QDateTime>
@@ -41,6 +44,7 @@ constexpr int commandNextTrack = 4;
 constexpr int commandPreviousTrack = 5;
 constexpr int pollIntervalMs = 1500;
 constexpr int nowPlayingTimeoutMs = 1000;
+constexpr qsizetype maxAlbumArtBytes = 5 * 1024 * 1024;
 constexpr double minimumPlayingRate = 0.01;
 
 template<typename T>
@@ -71,6 +75,21 @@ bool cfNumberToDouble(CFTypeRef value, double *number)
     return value && CFGetTypeID(value) == CFNumberGetTypeID() && CFNumberGetValue(static_cast<CFNumberRef>(value), kCFNumberDoubleType, number);
 }
 
+QByteArray cfDataToByteArray(CFTypeRef value)
+{
+    if (!value || CFGetTypeID(value) != CFDataGetTypeID()) {
+        return {};
+    }
+
+    auto data = static_cast<CFDataRef>(value);
+    const CFIndex length = CFDataGetLength(data);
+    if (length <= 0 || length > maxAlbumArtBytes) {
+        return {};
+    }
+
+    return QByteArray(reinterpret_cast<const char *>(CFDataGetBytePtr(data)), length);
+}
+
 qlonglong secondsToMilliseconds(double seconds, qlonglong fallback = 0)
 {
     if (!std::isfinite(seconds) || seconds < 0) {
@@ -90,6 +109,7 @@ struct NowPlayingInfo {
     double playbackRate = 0.0;
     bool isPlaying = false;
     bool hasUsefulMetadata = false;
+    QByteArray artworkBytes;
     QString source;
 };
 
@@ -171,12 +191,13 @@ public:
     CFStringRef keyDuration() const { return key(m_keyDuration); }
     CFStringRef keyElapsedTime() const { return key(m_keyElapsedTime); }
     CFStringRef keyPlaybackRate() const { return key(m_keyPlaybackRate); }
+    CFStringRef keyArtworkData() const { return key(m_keyArtworkData); }
 
 private:
     MediaRemote()
     {
         if (qEnvironmentVariableIsSet("KDECONNECT_DISABLE_MACOS_MEDIAREMOTE")) {
-            qCInfo(KDECONNECT_PLUGIN_MPRISCONTROL) << "macOS MediaRemote disabled by KDECONNECT_DISABLE_MACOS_MEDIAREMOTE";
+            qCWarning(KDECONNECT_PLUGIN_MPRISCONTROL) << "macOS MediaRemote disabled by KDECONNECT_DISABLE_MACOS_MEDIAREMOTE";
             return;
         }
 
@@ -196,6 +217,7 @@ private:
         m_keyDuration = loadSymbol<CFStringRef *>(m_handle, "kMRMediaRemoteNowPlayingInfoDuration");
         m_keyElapsedTime = loadSymbol<CFStringRef *>(m_handle, "kMRMediaRemoteNowPlayingInfoElapsedTime");
         m_keyPlaybackRate = loadSymbol<CFStringRef *>(m_handle, "kMRMediaRemoteNowPlayingInfoPlaybackRate");
+        m_keyArtworkData = loadSymbol<CFStringRef *>(m_handle, "kMRMediaRemoteNowPlayingInfoArtworkData");
 
         if (!m_sendCommand) {
             qCWarning(KDECONNECT_PLUGIN_MPRISCONTROL) << "MediaRemote command symbol unavailable";
@@ -220,6 +242,7 @@ private:
     CFStringRef *m_keyDuration = nullptr;
     CFStringRef *m_keyElapsedTime = nullptr;
     CFStringRef *m_keyPlaybackRate = nullptr;
+    CFStringRef *m_keyArtworkData = nullptr;
 };
 
 NowPlayingInfo readNowPlayingInfo(CFDictionaryRef info)
@@ -250,9 +273,10 @@ NowPlayingInfo readNowPlayingInfo(CFDictionaryRef info)
         result.playbackRate = number;
         result.isPlaying = number > minimumPlayingRate;
     }
+    result.artworkBytes = cfDataToByteArray(value(MediaRemote::self().keyArtworkData()));
 
     result.hasUsefulMetadata = !result.title.isEmpty() || !result.artist.isEmpty() || !result.album.isEmpty() || result.length >= 0 || result.hasPosition
-        || result.hasPlaybackRate;
+        || result.hasPlaybackRate || !result.artworkBytes.isEmpty();
     if (result.hasUsefulMetadata) {
         result.source = QStringLiteral("MediaRemote");
     }
@@ -318,6 +342,7 @@ function read(appName, durationMultiplier) {
     app.includeStandardAdditions = true;
     if (!app.running()) return null;
     const state = String(app.playerState ? app.playerState() : '');
+    if (state.toLowerCase() !== 'playing') return null;
     const track = app.currentTrack();
     const duration = Number(track.duration ? track.duration() : 0);
     const position = Number(app.playerPosition ? app.playerPosition() : 0);
@@ -336,9 +361,117 @@ function read(appName, durationMultiplier) {
   } catch (e) { return null; }
 }
 const candidates = [read('Music', 1000), read('Spotify', 1)].filter(Boolean);
-JSON.stringify(candidates.find(x => x.isPlaying) || candidates[0] || {});
+JSON.stringify(candidates[0] || {});
 )JS");
     return runAppleScript(script, QStringLiteral("AppleScript"));
+}
+
+QByteArray readMusicArtworkFallback()
+{
+    QTemporaryFile file;
+    if (!file.open()) {
+        return {};
+    }
+
+    const QString path = file.fileName();
+    file.close();
+
+    QProcess process;
+    process.setProgram(QStringLiteral("/usr/bin/osascript"));
+    process.setArguments({QStringLiteral("-e"), QStringLiteral(R"AS(
+on run argv
+    set outputPath to item 1 of argv
+    try
+        tell application "Music"
+            if it is not running then return
+            set currentArtwork to artwork 1 of current track
+            set artworkData to raw data of currentArtwork
+            set outputFile to open for access POSIX file outputPath with write permission
+            set eof of outputFile to 0
+            write artworkData to outputFile
+            close access outputFile
+        end tell
+    end try
+end run
+)AS"), path});
+    process.start();
+    if (!process.waitForFinished(900) || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Music artwork fallback failed" << process.exitCode() << QString::fromUtf8(process.readAllStandardError()).trimmed();
+        process.kill();
+        process.waitForFinished(100);
+        return {};
+    }
+
+    if (!file.open() || file.size() <= 0 || file.size() > maxAlbumArtBytes) {
+        qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Music artwork fallback empty or too large" << file.size();
+        return {};
+    }
+    return file.readAll();
+}
+
+QByteArray readSpotifyArtworkFallback()
+{
+    static const QString script = QStringLiteral(R"JS(
+try {
+  const app = Application('Spotify');
+  if (!app.running()) '';
+  else String(app.currentTrack().artworkUrl ? app.currentTrack().artworkUrl() : '');
+} catch (e) { ''; }
+)JS");
+
+    QProcess osascript;
+    osascript.setProgram(QStringLiteral("/usr/bin/osascript"));
+    osascript.setArguments({QStringLiteral("-l"), QStringLiteral("JavaScript"), QStringLiteral("-e"), script});
+    osascript.start();
+    if (!osascript.waitForFinished(900) || osascript.exitStatus() != QProcess::NormalExit || osascript.exitCode() != 0) {
+        qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Spotify artwork URL fallback failed" << osascript.exitCode()
+                                                << QString::fromUtf8(osascript.readAllStandardError()).trimmed();
+        osascript.kill();
+        osascript.waitForFinished(100);
+        return {};
+    }
+
+    const QString url = QString::fromUtf8(osascript.readAllStandardOutput()).trimmed();
+    if (!url.startsWith(QLatin1String("https://i.scdn.co/image/"))) {
+        return {};
+    }
+
+    QProcess curl;
+    curl.setProgram(QStringLiteral("/usr/bin/curl"));
+    curl.setArguments({QStringLiteral("--silent"),
+                       QStringLiteral("--show-error"),
+                       QStringLiteral("--location"),
+                       QStringLiteral("--max-time"),
+                       QStringLiteral("2"),
+                       QStringLiteral("--max-filesize"),
+                       QString::number(maxAlbumArtBytes),
+                       url});
+    curl.start();
+    if (!curl.waitForFinished(2500) || curl.exitStatus() != QProcess::NormalExit || curl.exitCode() != 0) {
+        qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Spotify artwork download failed" << curl.exitCode() << QString::fromUtf8(curl.readAllStandardError()).trimmed();
+        curl.kill();
+        curl.waitForFinished(100);
+        return {};
+    }
+
+    const QByteArray artwork = curl.readAllStandardOutput();
+    if (artwork.isEmpty() || artwork.size() > maxAlbumArtBytes) {
+        qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Spotify artwork download empty or too large" << artwork.size();
+        return {};
+    }
+    return artwork;
+}
+
+QByteArray readAppleScriptArtworkFallback(const QString &source)
+{
+    if (source.contains(QLatin1String("Spotify"), Qt::CaseInsensitive)) {
+        return readSpotifyArtworkFallback();
+    }
+
+    if (source.contains(QLatin1String("Music"), Qt::CaseInsensitive)) {
+        return readMusicArtworkFallback();
+    }
+    return {};
 }
 
 NowPlayingInfo queryPlatformHelperFallback()
@@ -449,6 +582,11 @@ void MprisControlPlugin::receivePacket(const NetworkPacket &np)
         return;
     }
 
+    if (np.has(QStringLiteral("albumArtUrl"))) {
+        sendAlbumArt(np.get<QString>(QStringLiteral("albumArtUrl")));
+        return;
+    }
+
     bool handledAction = false;
     if (np.has(QStringLiteral("action"))) {
         const QString action = np.get<QString>(QStringLiteral("action"));
@@ -503,6 +641,7 @@ void MprisControlPlugin::receivePacket(const NetworkPacket &np)
     if (handledAction) {
         sendNowPlaying();
     } else if (np.get<bool>(QStringLiteral("requestNowPlaying"))) {
+        sendPlayerList();
         sendNowPlaying(true);
     }
 }
@@ -511,8 +650,32 @@ void MprisControlPlugin::sendPlayerList()
 {
     NetworkPacket np(PACKET_TYPE_MPRIS);
     np.set(QStringLiteral("playerList"), QStringList{nowPlayingPlayer()});
-    np.set(QStringLiteral("supportAlbumArtPayload"), false);
+    np.set(QStringLiteral("supportAlbumArtPayload"), true);
     sendPacket(np);
+}
+
+bool MprisControlPlugin::sendAlbumArt(const QString &requestedAlbumArtUrl)
+{
+    if (requestedAlbumArtUrl.isEmpty() || requestedAlbumArtUrl != m_albumArtUrl || m_albumArtBytes.isEmpty() || m_albumArtBytes.size() > maxAlbumArtBytes) {
+        qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Ignoring album art request" << requestedAlbumArtUrl << "current" << m_albumArtUrl << "bytes"
+                                               << m_albumArtBytes.size();
+        return false;
+    }
+
+    auto buffer = QSharedPointer<QBuffer>::create();
+    buffer->setData(m_albumArtBytes);
+    if (!buffer->open(QIODevice::ReadOnly)) {
+        return false;
+    }
+
+    NetworkPacket answer(PACKET_TYPE_MPRIS);
+    answer.set(QStringLiteral("transferringAlbumArt"), true);
+    answer.set(QStringLiteral("player"), nowPlayingPlayer());
+    answer.set(QStringLiteral("albumArtUrl"), requestedAlbumArtUrl);
+    answer.setPayload(buffer, buffer->size());
+    qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Sending album art payload" << requestedAlbumArtUrl << buffer->size();
+    sendPacket(answer);
+    return true;
 }
 
 void MprisControlPlugin::sendNowPlaying(bool force)
@@ -544,6 +707,29 @@ QVariantMap MprisControlPlugin::defaultNowPlayingBody() const
     body[QStringLiteral("canGoPrevious")] = canSendCommands;
     body[QStringLiteral("canSeek")] = false;
     return body;
+}
+
+void MprisControlPlugin::updateAlbumArt(const QByteArray &artworkBytes)
+{
+    if (artworkBytes.isEmpty() || artworkBytes.size() > maxAlbumArtBytes) {
+        if (!m_albumArtBytes.isEmpty()) {
+            m_albumArtBytes.clear();
+            m_albumArtHash.clear();
+            m_albumArtUrl.clear();
+            ++m_albumArtRevision;
+        }
+        return;
+    }
+
+    const QByteArray hash = QCryptographicHash::hash(artworkBytes, QCryptographicHash::Sha256).toHex();
+    if (hash == m_albumArtHash) {
+        return;
+    }
+
+    m_albumArtBytes = artworkBytes;
+    m_albumArtHash = hash;
+    m_albumArtUrl = QStringLiteral("kdeconnect://macos-nowplaying/art/%1/%2").arg(++m_albumArtRevision).arg(QString::fromLatin1(hash.left(16)));
+    qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Cached album art" << m_albumArtUrl << m_albumArtBytes.size();
 }
 
 void MprisControlPlugin::updatePlaybackProgress(bool hasPosition, qlonglong position, bool hasPlaybackRate, double playbackRate, qint64 sampleTime)
@@ -601,6 +787,7 @@ void MprisControlPlugin::requestNowPlaying(bool force)
         const NowPlayingInfo nowPlaying = queryFallbackCascade(m_hasLastKnownIsPlaying, m_lastKnownIsPlaying);
         const qint64 sampleTime = QDateTime::currentMSecsSinceEpoch();
         QVariantMap body = defaultNowPlayingBody();
+        updateAlbumArt(readAppleScriptArtworkFallback(nowPlaying.source));
         body[QStringLiteral("title")] = nowPlaying.title;
         body[QStringLiteral("artist")] = nowPlaying.artist;
         body[QStringLiteral("album")] = nowPlaying.album;
@@ -631,6 +818,7 @@ void MprisControlPlugin::requestNowPlaying(bool force)
             qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "MediaRemote now-playing metadata request timed out";
             m_reportedNowPlayingTimeout = true;
         }
+        updateAlbumArt({});
         sendNowPlayingBody(defaultNowPlayingBody(), forceSend);
     });
 
@@ -664,6 +852,7 @@ void MprisControlPlugin::requestNowPlaying(bool force)
 
             QVariantMap body = guard->defaultNowPlayingBody();
             if (nowPlaying.hasUsefulMetadata) {
+                guard->updateAlbumArt(nowPlaying.artworkBytes.isEmpty() ? readAppleScriptArtworkFallback(nowPlaying.source) : nowPlaying.artworkBytes);
                 body[QStringLiteral("title")] = nowPlaying.title;
                 body[QStringLiteral("artist")] = nowPlaying.artist;
                 body[QStringLiteral("album")] = nowPlaying.album;
@@ -679,9 +868,12 @@ void MprisControlPlugin::requestNowPlaying(bool force)
                     qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Now-playing metadata available from" << nowPlaying.source;
                     guard->m_reportedNowPlayingInfo = true;
                 }
-            } else if (!guard->m_reportedEmptyNowPlayingInfo) {
-                qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "MediaRemote now-playing metadata empty; using safe defaults";
-                guard->m_reportedEmptyNowPlayingInfo = true;
+            } else {
+                guard->updateAlbumArt({});
+                if (!guard->m_reportedEmptyNowPlayingInfo) {
+                    qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "MediaRemote now-playing metadata empty; using safe defaults";
+                    guard->m_reportedEmptyNowPlayingInfo = true;
+                }
             }
 
             guard->sendNowPlayingBody(body, forceSend);
@@ -691,6 +883,8 @@ void MprisControlPlugin::requestNowPlaying(bool force)
 
 void MprisControlPlugin::sendNowPlayingBody(QVariantMap body, bool force)
 {
+    body[QStringLiteral("albumArtUrl")] = m_albumArtUrl;
+    body[QStringLiteral("supportAlbumArtPayload")] = true;
     estimatePlaybackProgress(body);
     if (!force && m_hasLastNowPlayingBody && body == m_lastNowPlayingBody) {
         return;

@@ -8,6 +8,7 @@
 
 #include <core/kdeconnectplugin.h>
 
+#include <QByteArray>
 #include <QStringList>
 #include <QUrl>
 #include <QVariantMap>
@@ -31,7 +32,9 @@ private:
     void pollNowPlaying();
     void requestNowPlaying(bool force);
     void sendNowPlayingBody(QVariantMap body, bool force);
+    bool sendAlbumArt(const QString &requestedAlbumArtUrl);
     QVariantMap defaultNowPlayingBody() const;
+    void updateAlbumArt(const QByteArray &artworkBytes);
     void updatePlaybackProgress(bool hasPosition, qlonglong position, bool hasPlaybackRate, double playbackRate, qint64 sampleTime);
     void estimatePlaybackProgress(QVariantMap &body) const;
 
@@ -49,6 +52,10 @@ private:
     qlonglong m_lastPosition = 0;
     qint64 m_lastPositionSampleTime = 0;
     double m_lastPlaybackRate = 0.0;
+    int m_albumArtRevision = 0;
+    QByteArray m_albumArtBytes;
+    QByteArray m_albumArtHash;
+    QString m_albumArtUrl;
     QVariantMap m_lastNowPlayingBody;
     QTimer *m_pollTimer = nullptr;
 };
