@@ -16,10 +16,12 @@
 #include <QTimer>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QDateTime>
 
 #include <cmath>
 #include <dlfcn.h>
 #include <memory>
+#include <algorithm>
 
 #import <Foundation/Foundation.h>
 
@@ -39,6 +41,7 @@ constexpr int commandNextTrack = 4;
 constexpr int commandPreviousTrack = 5;
 constexpr int pollIntervalMs = 1500;
 constexpr int nowPlayingTimeoutMs = 1000;
+constexpr double minimumPlayingRate = 0.01;
 
 template<typename T>
 T loadSymbol(void *handle, const char *name)
@@ -73,7 +76,7 @@ qlonglong secondsToMilliseconds(double seconds, qlonglong fallback = 0)
     if (!std::isfinite(seconds) || seconds < 0) {
         return fallback;
     }
-    return static_cast<qlonglong>(seconds * 1000.0);
+    return static_cast<qlonglong>(std::llround(seconds * 1000.0));
 }
 
 struct NowPlayingInfo {
@@ -82,7 +85,9 @@ struct NowPlayingInfo {
     QString album;
     qlonglong length = -1;
     qlonglong pos = 0;
+    bool hasPosition = false;
     bool hasPlaybackRate = false;
+    double playbackRate = 0.0;
     bool isPlaying = false;
     bool hasUsefulMetadata = false;
     QString source;
@@ -238,13 +243,15 @@ NowPlayingInfo readNowPlayingInfo(CFDictionaryRef info)
     }
     if (cfNumberToDouble(value(MediaRemote::self().keyElapsedTime()), &number)) {
         result.pos = secondsToMilliseconds(number);
+        result.hasPosition = true;
     }
     if (cfNumberToDouble(value(MediaRemote::self().keyPlaybackRate()), &number)) {
         result.hasPlaybackRate = true;
-        result.isPlaying = number > 0.01;
+        result.playbackRate = number;
+        result.isPlaying = number > minimumPlayingRate;
     }
 
-    result.hasUsefulMetadata = !result.title.isEmpty() || !result.artist.isEmpty() || !result.album.isEmpty() || result.length >= 0 || result.pos > 0
+    result.hasUsefulMetadata = !result.title.isEmpty() || !result.artist.isEmpty() || !result.album.isEmpty() || result.length >= 0 || result.hasPosition
         || result.hasPlaybackRate;
     if (result.hasUsefulMetadata) {
         result.source = QStringLiteral("MediaRemote");
@@ -290,9 +297,11 @@ NowPlayingInfo runAppleScript(const QString &script, const QString &source)
     result.album = object.value(QStringLiteral("album")).toString();
     result.length = object.value(QStringLiteral("length")).toInteger(-1);
     result.pos = object.value(QStringLiteral("pos")).toInteger(0);
+    result.hasPosition = object.contains(QStringLiteral("pos"));
     result.hasPlaybackRate = object.contains(QStringLiteral("isPlaying"));
+    result.playbackRate = object.value(QStringLiteral("playbackRate")).toDouble(object.value(QStringLiteral("isPlaying")).toBool(false) ? 1.0 : 0.0);
     result.isPlaying = object.value(QStringLiteral("isPlaying")).toBool(false);
-    result.hasUsefulMetadata = !result.title.isEmpty() || !result.artist.isEmpty() || !result.album.isEmpty() || result.length >= 0 || result.pos > 0
+    result.hasUsefulMetadata = !result.title.isEmpty() || !result.artist.isEmpty() || !result.album.isEmpty() || result.length >= 0 || result.hasPosition
         || result.hasPlaybackRate;
     if (result.hasUsefulMetadata) {
         result.source = object.value(QStringLiteral("source")).toString(source);
@@ -318,6 +327,7 @@ function read(appName, durationMultiplier) {
       album: String(track.album ? track.album() : ''),
       length: isFinite(duration) && duration > 0 ? Math.round(duration * durationMultiplier) : -1,
       pos: isFinite(position) && position > 0 ? Math.round(position * 1000) : 0,
+      playbackRate: state.toLowerCase() === 'playing' ? 1 : 0,
       isPlaying: state.toLowerCase() === 'playing',
       source: 'AppleScript/' + appName
     };
@@ -362,9 +372,11 @@ NowPlayingInfo queryPlatformHelperFallback()
     result.pos = object.value(QStringLiteral("pos")).toInteger(object.value(QStringLiteral("elapsed")).toDouble(0.0) > 0
                                                             ? static_cast<qint64>(object.value(QStringLiteral("elapsed")).toDouble() * 1000.0)
                                                             : 0);
+    result.hasPosition = object.contains(QStringLiteral("pos")) || object.contains(QStringLiteral("elapsed"));
     result.hasPlaybackRate = object.contains(QStringLiteral("isPlaying"));
+    result.playbackRate = object.value(QStringLiteral("playbackRate")).toDouble(object.value(QStringLiteral("isPlaying")).toBool(false) ? 1.0 : 0.0);
     result.isPlaying = object.value(QStringLiteral("isPlaying")).toBool(false);
-    result.hasUsefulMetadata = !result.title.isEmpty() || !result.artist.isEmpty() || !result.album.isEmpty() || result.length >= 0 || result.pos > 0
+    result.hasUsefulMetadata = !result.title.isEmpty() || !result.artist.isEmpty() || !result.album.isEmpty() || result.length >= 0 || result.hasPosition
         || result.hasPlaybackRate;
     if (result.hasUsefulMetadata) {
         result.source = QStringLiteral("platform-helper");
@@ -378,6 +390,7 @@ NowPlayingInfo fallbackNowPlayingInfo(bool hasLastKnownIsPlaying, bool lastKnown
     result.title = QStringLiteral("Now Playing");
     result.hasPlaybackRate = true;
     result.isPlaying = hasLastKnownIsPlaying ? lastKnownIsPlaying : false;
+    result.playbackRate = result.isPlaying ? 1.0 : 0.0;
     result.hasUsefulMetadata = true;
     result.source = QStringLiteral("safe-default");
     return result;
@@ -443,24 +456,48 @@ void MprisControlPlugin::receivePacket(const NetworkPacket &np)
             MediaRemote::self().sendCommand(commandPlay);
             m_lastKnownIsPlaying = true;
             m_hasLastKnownIsPlaying = true;
+            m_lastPlaybackRate = 1.0;
+            if (m_hasLastPosition) {
+                m_lastPositionSampleTime = QDateTime::currentMSecsSinceEpoch();
+            }
             handledAction = true;
         } else if (action == QStringLiteral("Pause") || action == QStringLiteral("Stop")) {
+            QVariantMap body = defaultNowPlayingBody();
+            estimatePlaybackProgress(body);
+            m_lastPosition = body.value(QStringLiteral("pos")).toLongLong();
+            m_lastPositionSampleTime = QDateTime::currentMSecsSinceEpoch();
             MediaRemote::self().sendCommand(commandPause);
             m_lastKnownIsPlaying = false;
             m_hasLastKnownIsPlaying = true;
+            m_lastPlaybackRate = 0.0;
             handledAction = true;
         } else if (action == QStringLiteral("PlayPause")) {
+            const bool willPlay = m_hasLastKnownIsPlaying ? !m_lastKnownIsPlaying : true;
+            QVariantMap body = defaultNowPlayingBody();
+            estimatePlaybackProgress(body);
+            m_lastPosition = body.value(QStringLiteral("pos")).toLongLong();
+            m_lastPositionSampleTime = QDateTime::currentMSecsSinceEpoch();
             MediaRemote::self().sendCommand(commandTogglePlayPause);
-            m_lastKnownIsPlaying = m_hasLastKnownIsPlaying ? !m_lastKnownIsPlaying : true;
+            m_lastKnownIsPlaying = willPlay;
             m_hasLastKnownIsPlaying = true;
+            m_lastPlaybackRate = m_lastKnownIsPlaying ? 1.0 : 0.0;
             handledAction = true;
         } else if (action == QStringLiteral("Next")) {
             MediaRemote::self().sendCommand(commandNextTrack);
+            m_hasLastPosition = false;
             handledAction = true;
         } else if (action == QStringLiteral("Previous")) {
             MediaRemote::self().sendCommand(commandPreviousTrack);
+            m_hasLastPosition = false;
             handledAction = true;
         }
+    }
+
+    // MediaRemote has a private SeekToPlaybackPosition command, but this backend has no locally verified,
+    // safe argument dictionary contract for it yet. Keep canSeek=false and ignore seek packets until validated.
+    if ((np.has(QStringLiteral("Seek")) || np.has(QStringLiteral("SetPosition"))) && !m_reportedSeekUnsupported) {
+        qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Ignoring seek request: no safely verified MediaRemote seek implementation is available";
+        m_reportedSeekUnsupported = true;
     }
 
     if (handledAction) {
@@ -509,6 +546,50 @@ QVariantMap MprisControlPlugin::defaultNowPlayingBody() const
     return body;
 }
 
+void MprisControlPlugin::updatePlaybackProgress(bool hasPosition, qlonglong position, bool hasPlaybackRate, double playbackRate, qint64 sampleTime)
+{
+    const double previousPlaybackRate = m_lastPlaybackRate;
+    if (hasPlaybackRate) {
+        m_lastPlaybackRate = playbackRate;
+    }
+    if (!hasPosition) {
+        return;
+    }
+
+    if (hasPlaybackRate && playbackRate > minimumPlayingRate && previousPlaybackRate > minimumPlayingRate && m_hasLastPosition && position <= m_lastPosition
+        && position + 1000 >= m_lastPosition) {
+        const qint64 elapsed = sampleTime - m_lastPositionSampleTime;
+        if (elapsed > 0) {
+            position = m_lastPosition + static_cast<qlonglong>(elapsed * previousPlaybackRate);
+        }
+    }
+
+    m_lastPosition = position;
+    m_lastPositionSampleTime = sampleTime;
+    m_hasLastPosition = true;
+}
+
+void MprisControlPlugin::estimatePlaybackProgress(QVariantMap &body) const
+{
+    if (!m_hasLastPosition) {
+        return;
+    }
+
+    qlonglong position = m_lastPosition;
+    if (m_lastPlaybackRate > minimumPlayingRate) {
+        const qint64 elapsed = QDateTime::currentMSecsSinceEpoch() - m_lastPositionSampleTime;
+        if (elapsed > 0) {
+            position += static_cast<qlonglong>(elapsed * m_lastPlaybackRate);
+        }
+    }
+
+    const qlonglong length = body.value(QStringLiteral("length"), -1).toLongLong();
+    if (length >= 0) {
+        position = std::min(position, length);
+    }
+    body[QStringLiteral("pos")] = std::max<qlonglong>(0, position);
+}
+
 void MprisControlPlugin::requestNowPlaying(bool force)
 {
     if (m_nowPlayingRequestInFlight) {
@@ -518,12 +599,14 @@ void MprisControlPlugin::requestNowPlaying(bool force)
 
     if (!MediaRemote::self().canReadNowPlayingInfo()) {
         const NowPlayingInfo nowPlaying = queryFallbackCascade(m_hasLastKnownIsPlaying, m_lastKnownIsPlaying);
+        const qint64 sampleTime = QDateTime::currentMSecsSinceEpoch();
         QVariantMap body = defaultNowPlayingBody();
         body[QStringLiteral("title")] = nowPlaying.title;
         body[QStringLiteral("artist")] = nowPlaying.artist;
         body[QStringLiteral("album")] = nowPlaying.album;
         body[QStringLiteral("length")] = nowPlaying.length;
         body[QStringLiteral("pos")] = nowPlaying.pos;
+        updatePlaybackProgress(nowPlaying.hasPosition, nowPlaying.pos, nowPlaying.hasPlaybackRate, nowPlaying.playbackRate, sampleTime);
         if (nowPlaying.hasPlaybackRate) {
             m_lastKnownIsPlaying = nowPlaying.isPlaying;
             m_hasLastKnownIsPlaying = true;
@@ -559,6 +642,7 @@ void MprisControlPlugin::requestNowPlaying(bool force)
         const bool hasLastKnownIsPlaying = guard ? guard->m_hasLastKnownIsPlaying : false;
         const bool lastKnownIsPlaying = guard ? guard->m_lastKnownIsPlaying : false;
         NowPlayingInfo nowPlaying;
+        const qint64 sampleTime = QDateTime::currentMSecsSinceEpoch();
         @autoreleasepool {
             nowPlaying = readNowPlayingInfo(info);
         }
@@ -566,7 +650,7 @@ void MprisControlPlugin::requestNowPlaying(bool force)
             mergeNowPlaying(nowPlaying, queryFallbackCascade(hasLastKnownIsPlaying, lastKnownIsPlaying));
         }
 
-        QMetaObject::invokeMethod(guard.data(), [guard, requestId, nowPlaying]() {
+        QMetaObject::invokeMethod(guard.data(), [guard, requestId, nowPlaying, sampleTime]() {
             if (!guard) {
                 return;
             }
@@ -585,6 +669,7 @@ void MprisControlPlugin::requestNowPlaying(bool force)
                 body[QStringLiteral("album")] = nowPlaying.album;
                 body[QStringLiteral("length")] = nowPlaying.length;
                 body[QStringLiteral("pos")] = nowPlaying.pos;
+                guard->updatePlaybackProgress(nowPlaying.hasPosition, nowPlaying.pos, nowPlaying.hasPlaybackRate, nowPlaying.playbackRate, sampleTime);
                 if (nowPlaying.hasPlaybackRate) {
                     guard->m_lastKnownIsPlaying = nowPlaying.isPlaying;
                     guard->m_hasLastKnownIsPlaying = true;
@@ -604,8 +689,9 @@ void MprisControlPlugin::requestNowPlaying(bool force)
     });
 }
 
-void MprisControlPlugin::sendNowPlayingBody(const QVariantMap &body, bool force)
+void MprisControlPlugin::sendNowPlayingBody(QVariantMap body, bool force)
 {
+    estimatePlaybackProgress(body);
     if (!force && m_hasLastNowPlayingBody && body == m_lastNowPlayingBody) {
         return;
     }

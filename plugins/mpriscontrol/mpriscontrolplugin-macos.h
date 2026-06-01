@@ -30,8 +30,10 @@ private:
     void sendNowPlaying(bool force = true);
     void pollNowPlaying();
     void requestNowPlaying(bool force);
-    void sendNowPlayingBody(const QVariantMap &body, bool force);
+    void sendNowPlayingBody(QVariantMap body, bool force);
     QVariantMap defaultNowPlayingBody() const;
+    void updatePlaybackProgress(bool hasPosition, qlonglong position, bool hasPlaybackRate, double playbackRate, qint64 sampleTime);
+    void estimatePlaybackProgress(QVariantMap &body) const;
 
     bool m_lastKnownIsPlaying = false;
     bool m_hasLastKnownIsPlaying = false;
@@ -41,7 +43,12 @@ private:
     bool m_reportedEmptyNowPlayingInfo = false;
     bool m_reportedNowPlayingInfo = false;
     bool m_reportedNowPlayingTimeout = false;
+    bool m_reportedSeekUnsupported = false;
+    bool m_hasLastPosition = false;
     int m_nowPlayingRequestId = 0;
+    qlonglong m_lastPosition = 0;
+    qint64 m_lastPositionSampleTime = 0;
+    double m_lastPlaybackRate = 0.0;
     QVariantMap m_lastNowPlayingBody;
     QTimer *m_pollTimer = nullptr;
 };
