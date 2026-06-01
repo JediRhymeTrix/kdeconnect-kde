@@ -17,7 +17,11 @@ endif()
 
 add_subdirectory(presenter)
 
-if((WIN32 AND MSVC AND ("${CMAKE_SYSTEM_VERSION}" VERSION_GREATER_EQUAL 10.0.17763.0)) OR (NOT WIN32 AND NOT APPLE))
+if(APPLE)
+    option(WITH_MACOS_MEDIAREMOTE "Build experimental macOS MediaRemote MPRIS control backend" OFF)
+endif()
+
+if((WIN32 AND MSVC AND ("${CMAKE_SYSTEM_VERSION}" VERSION_GREATER_EQUAL 10.0.17763.0)) OR (NOT WIN32 AND NOT APPLE) OR (APPLE AND WITH_MACOS_MEDIAREMOTE))
     add_subdirectory(mpriscontrol)
 endif()
 add_subdirectory(mprisremote)
