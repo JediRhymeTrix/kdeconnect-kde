@@ -10,6 +10,9 @@
 
 #include <QStringList>
 #include <QUrl>
+#include <QVariantMap>
+
+class QTimer;
 
 #define PACKET_TYPE_MPRIS QStringLiteral("kdeconnect.mpris")
 
@@ -24,8 +27,21 @@ public:
 
 private:
     void sendPlayerList();
-    void sendNowPlaying();
+    void sendNowPlaying(bool force = true);
+    void pollNowPlaying();
+    void requestNowPlaying(bool force);
+    void sendNowPlayingBody(const QVariantMap &body, bool force);
+    QVariantMap defaultNowPlayingBody() const;
 
     bool m_lastKnownIsPlaying = false;
     bool m_hasLastKnownIsPlaying = false;
+    bool m_hasLastNowPlayingBody = false;
+    bool m_nowPlayingRequestInFlight = false;
+    bool m_forceSendAfterNowPlayingReply = false;
+    bool m_reportedEmptyNowPlayingInfo = false;
+    bool m_reportedNowPlayingInfo = false;
+    bool m_reportedNowPlayingTimeout = false;
+    int m_nowPlayingRequestId = 0;
+    QVariantMap m_lastNowPlayingBody;
+    QTimer *m_pollTimer = nullptr;
 };
