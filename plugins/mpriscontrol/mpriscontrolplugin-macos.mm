@@ -33,25 +33,6 @@
 
 K_PLUGIN_CLASS_WITH_JSON(MprisControlPlugin, "kdeconnect_mpriscontrol.json")
 
-struct NowPlayingInfo {
-    QString title;
-    QString artist;
-    QString album;
-    qlonglong length = -1;
-    qlonglong pos = 0;
-    bool hasPosition = false;
-    bool hasPlaybackRate = false;
-    double playbackRate = 0.0;
-    bool isPlaying = false;
-    bool hasDescriptiveMetadata = false;
-    bool hasUsefulMetadata = false;
-    QByteArray artworkBytes;
-    QString source;
-    QString bundleIdentifier;
-    QString contentItemIdentifier;
-    qint64 processIdentifier = 0;
-};
-
 namespace
 {
 QString nowPlayingPlayer()
@@ -717,10 +698,7 @@ void MprisControlPlugin::receivePacket(const NetworkPacket &np)
     }
 
     const QString player = np.get<QString>(keyPlayer);
-    // Accept the previous player name as well: the remote may still address the old
-    // entry until it processes the updated player list.
-    const bool knownPlayer =
-        player.isEmpty() || player == currentPlayerName() || player == m_previousPlayerName || player == QLatin1String("Now Playing");
+    const bool knownPlayer = player.isEmpty() || isKnownPlayerName(player);
 
     if (np.get<bool>(QStringLiteral("requestPlayerList"))) {
         sendPlayerList();
@@ -740,13 +718,13 @@ void MprisControlPlugin::receivePacket(const NetworkPacket &np)
 
     bool handledAction = false;
     if (np.has(QStringLiteral("action"))) {
-        handledAction = handleAction(np.get<QString>(QStringLiteral("action")));
+        handledAction = handleAction(np.get<QString>(QStringLiteral("action")), player);
     }
 
-    // Seek is delivered through the media-control helper; direct MediaRemote has a private
-    // SeekToPlaybackPosition command, but this backend has no locally verified, safe argument
-    // dictionary contract for it.
-    const bool handledSeek = handleSeekPacket(np);
+    // Seek is delivered through the external media-control helper. Direct MediaRemote has a
+    // private SeekToPlaybackPosition command, but no locally verified safe argument
+    // dictionary contract for it exists, so seek is only offered when the helper runs.
+    const bool handledSeek = handleSeekPacket(np, player);
     if (handledSeek && !handledAction) {
         sendNowPlaying();
     }
@@ -755,12 +733,23 @@ void MprisControlPlugin::receivePacket(const NetworkPacket &np)
         sendNowPlaying();
     } else if (np.get<bool>(QStringLiteral("requestNowPlaying"))) {
         sendPlayerList();
-        sendNowPlaying(true);
+        sendNowPlaying(true, player);
     }
 }
 
-bool MprisControlPlugin::handleAction(const QString &action)
+bool MprisControlPlugin::handleAction(const QString &action, const QString &player)
 {
+    // Commands can only reach the application that currently owns now playing (the helper
+    // and MediaRemote both address the elected application only). The system "Now Playing"
+    // player and the active application player both act on it; other session players are
+    // view-only and report no control capabilities.
+    SessionPlayer *entry = sessionPlayer(player);
+    const bool controlElected = player.isEmpty() || (entry && (entry->isSystem || entry->isActive));
+    if (!controlElected) {
+        qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Ignoring command for player that does not own now playing:" << player;
+        return false;
+    }
+
     // Commands prefer the external media-control helper (works on macOS 15.4+ where direct
     // MediaRemote command delivery is gated); direct MediaRemote remains as fallback.
     auto sendCommand = [this](const char *helperCommand, int mediaRemoteCommand) {
@@ -776,7 +765,7 @@ bool MprisControlPlugin::handleAction(const QString &action)
     };
 
     auto freezeProgress = [this]() {
-        QVariantMap body = defaultNowPlayingBody();
+        QVariantMap body = playerBody(currentPlayerName(), true);
         estimatePlaybackProgress(body);
         m_lastPosition = body.value(keyPos).toLongLong();
         m_lastPositionSampleTime = QDateTime::currentMSecsSinceEpoch();
@@ -828,7 +817,67 @@ bool MprisControlPlugin::handleAction(const QString &action)
 
 QString MprisControlPlugin::currentPlayerName() const
 {
-    return m_activePlayerName.isEmpty() ? QStringLiteral("Now Playing") : m_activePlayerName;
+    for (const SessionPlayer &entry : m_sessionPlayers) {
+        if (entry.isActive && !entry.isSystem) {
+            return entry.name;
+        }
+    }
+    return nowPlayingPlayer();
+}
+
+MprisControlPlugin::SessionPlayer *MprisControlPlugin::sessionPlayer(const QString &name)
+{
+    for (SessionPlayer &entry : m_sessionPlayers) {
+        if (entry.name == name) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+MprisControlPlugin::SessionPlayer *MprisControlPlugin::systemPlayer()
+{
+    for (SessionPlayer &entry : m_sessionPlayers) {
+        if (entry.isSystem) {
+            return &entry;
+        }
+    }
+    m_sessionPlayers.append(SessionPlayer{});
+    SessionPlayer &entry = m_sessionPlayers.last();
+    entry.name = nowPlayingPlayer();
+    entry.isSystem = true;
+    entry.isActive = true;
+    return &entry;
+}
+
+bool MprisControlPlugin::isKnownPlayerName(const QString &player) const
+{
+    for (const SessionPlayer &entry : m_sessionPlayers) {
+        if (entry.name == player) {
+            return true;
+        }
+    }
+    return player == nowPlayingPlayer();
+}
+
+void MprisControlPlugin::pruneStoppedPlayers()
+{
+    for (SessionPlayer &entry : m_sessionPlayers) {
+        if (entry.isSystem || entry.processIdentifier <= 0) {
+            continue;
+        }
+        const bool running = [entry]() {
+            @autoreleasepool {
+                return [NSRunningApplication runningApplicationWithProcessIdentifier:static_cast<pid_t>(entry.processIdentifier)] != nil;
+            }
+        }();
+        entry.isRunning = running;
+    }
+    for (int i = m_sessionPlayers.size() - 1; i >= 0; --i) {
+        if (!m_sessionPlayers[i].isSystem && !m_sessionPlayers[i].isRunning) {
+            m_sessionPlayers.removeAt(i);
+        }
+    }
 }
 
 bool MprisControlPlugin::sendMediaControlCommand(const QStringList &arguments)
@@ -853,7 +902,7 @@ bool MprisControlPlugin::sendMediaControlCommand(const QStringList &arguments)
     return true;
 }
 
-bool MprisControlPlugin::handleSeekPacket(const NetworkPacket &np)
+bool MprisControlPlugin::handleSeekPacket(const NetworkPacket &np, const QString &player)
 {
     const bool hasSetPosition = np.has(QStringLiteral("SetPosition"));
     const bool hasSeek = np.has(QStringLiteral("Seek"));
@@ -861,9 +910,10 @@ bool MprisControlPlugin::handleSeekPacket(const NetworkPacket &np)
         return false;
     }
 
-    if (m_mediaControlProgram.isEmpty()) {
+    SessionPlayer *entry = sessionPlayer(player);
+    if (m_mediaControlProgram.isEmpty() || player.isEmpty() || !entry || !(entry->isSystem || entry->isActive)) {
         if (!m_reportedSeekUnsupported) {
-            qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Ignoring seek request: no verified seek implementation available";
+            qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Ignoring seek request: no verified seek implementation available for player" << player;
             m_reportedSeekUnsupported = true;
         }
         return false;
@@ -873,12 +923,12 @@ bool MprisControlPlugin::handleSeekPacket(const NetworkPacket &np)
     if (hasSetPosition) {
         targetMs = np.get<qlonglong>(QStringLiteral("SetPosition"), 0);
     } else {
-        QVariantMap body = defaultNowPlayingBody();
+        QVariantMap body = playerBody(currentPlayerName(), true);
         estimatePlaybackProgress(body);
         targetMs = body.value(keyPos).toLongLong() + np.get<qlonglong>(QStringLiteral("Seek"), 0);
     }
     targetMs = std::max<qlonglong>(0, targetMs);
-    const qlonglong length = m_lastNowPlayingBody.value(keyLength, -1).toLongLong();
+    const qlonglong length = entry->lastBody.value(keyLength, -1).toLongLong();
     if (length >= 0) {
         targetMs = std::min(targetMs, length);
     }
@@ -899,20 +949,46 @@ bool MprisControlPlugin::handleSeekPacket(const NetworkPacket &np)
 
 void MprisControlPlugin::updateActivePlayer(const NowPlayingInfo &nowPlaying)
 {
-    if (nowPlaying.bundleIdentifier.isEmpty() || nowPlaying.bundleIdentifier == m_activeAppBundleIdentifier) {
+    if (nowPlaying.bundleIdentifier.isEmpty()) {
         return;
     }
 
-    m_activeAppBundleIdentifier = nowPlaying.bundleIdentifier;
-    const QString previousName = currentPlayerName();
-    m_activePlayerName = applicationDisplayName(nowPlaying.bundleIdentifier, nowPlaying.processIdentifier);
-    m_previousPlayerName = previousName;
-    m_lastSupportedSource.clear();
-    qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Active player is now" << m_activePlayerName << nowPlaying.bundleIdentifier;
+    SessionPlayer *existing = nullptr;
+    for (SessionPlayer &entry : m_sessionPlayers) {
+        if (!entry.isSystem && entry.bundleIdentifier == nowPlaying.bundleIdentifier) {
+            existing = &entry;
+            break;
+        }
+    }
 
-    // Re-announce the player list so the remote replaces the old entry. Without this the
-    // remote ignores now-playing updates for the renamed player and keeps addressing
-    // commands to the stale name.
+    const QString name = applicationDisplayName(nowPlaying.bundleIdentifier, nowPlaying.processIdentifier);
+    const bool sameActive = existing && existing->isActive && existing->name == name;
+    if (sameActive) {
+        return;
+    }
+
+    // Register or reactivate the owning application and demote the previous one.
+    for (SessionPlayer &entry : m_sessionPlayers) {
+        if (!entry.isSystem) {
+            entry.isActive = false;
+        }
+    }
+    if (existing) {
+        existing->isActive = true;
+        existing->name = name;
+    } else {
+        SessionPlayer entry;
+        entry.name = name;
+        entry.bundleIdentifier = nowPlaying.bundleIdentifier;
+        entry.processIdentifier = nowPlaying.processIdentifier;
+        entry.isActive = true;
+        m_sessionPlayers.prepend(entry);
+    }
+    m_lastSupportedSource.clear();
+    qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Active player is now" << name << nowPlaying.bundleIdentifier;
+
+    // Re-announce the player list so the remote shows the new source and replaces stale
+    // entries instead of ignoring updates for an unknown player name.
     sendPlayerList();
 }
 
@@ -954,7 +1030,12 @@ NowPlayingInfo MprisControlPlugin::queryMediaControl()
 
     // Artwork is heavy; fetch it only when the playing item changed and keep the cached bytes otherwise.
     if (m_mediaControlArtworkValid && result.contentItemIdentifier == m_mediaControlArtworkItemId) {
-        result.artworkBytes = m_albumArtBytes;
+        for (const SessionPlayer &entry : m_sessionPlayers) {
+            if (!entry.isSystem && entry.bundleIdentifier == result.bundleIdentifier) {
+                result.artworkBytes = entry.artworkBytes;
+                break;
+            }
+        }
         return result;
     }
 
@@ -985,29 +1066,56 @@ NowPlayingInfo MprisControlPlugin::queryMediaControl()
 
 void MprisControlPlugin::sendPlayerList()
 {
+    pruneStoppedPlayers();
+
+    // The active application first, then the other sources seen this session, then the
+    // system-wide "Now Playing" fallback that always controls whatever owns now playing.
+    QStringList players;
+    for (const SessionPlayer &entry : m_sessionPlayers) {
+        if (!entry.isSystem && entry.isActive) {
+            players.append(entry.name);
+        }
+    }
+    for (const SessionPlayer &entry : m_sessionPlayers) {
+        if (!entry.isSystem && !entry.isActive) {
+            players.append(entry.name);
+        }
+    }
+    players.append(nowPlayingPlayer());
+
     NetworkPacket np(PACKET_TYPE_MPRIS);
-    np.set(QStringLiteral("playerList"), QStringList{currentPlayerName()});
+    np.set(QStringLiteral("playerList"), players);
     np.set(QStringLiteral("supportAlbumArtPayload"), true);
     sendPacket(np);
 }
 
 bool MprisControlPlugin::sendAlbumArt(const QString &requestedAlbumArtUrl)
 {
-    if (requestedAlbumArtUrl.isEmpty() || requestedAlbumArtUrl != m_albumArtUrl || m_albumArtBytes.isEmpty() || m_albumArtBytes.size() > maxAlbumArtBytes) {
-        qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Ignoring album art request" << requestedAlbumArtUrl << "current" << m_albumArtUrl << "bytes"
-                                               << m_albumArtBytes.size();
+    if (requestedAlbumArtUrl.isEmpty()) {
+        return false;
+    }
+
+    const SessionPlayer *owner = nullptr;
+    for (const SessionPlayer &entry : m_sessionPlayers) {
+        if (entry.artworkUrl == requestedAlbumArtUrl) {
+            owner = &entry;
+            break;
+        }
+    }
+    if (!owner || owner->artworkBytes.isEmpty() || owner->artworkBytes.size() > maxAlbumArtBytes) {
+        qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Ignoring album art request" << requestedAlbumArtUrl;
         return false;
     }
 
     auto buffer = QSharedPointer<QBuffer>::create();
-    buffer->setData(m_albumArtBytes);
+    buffer->setData(owner->artworkBytes);
     if (!buffer->open(QIODevice::ReadOnly)) {
         return false;
     }
 
     NetworkPacket answer(PACKET_TYPE_MPRIS);
     answer.set(QStringLiteral("transferringAlbumArt"), true);
-    answer.set(keyPlayer, currentPlayerName());
+    answer.set(keyPlayer, owner->name);
     answer.set(keyAlbumArtUrl, requestedAlbumArtUrl);
     answer.setPayload(buffer, buffer->size());
     qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Sending album art payload" << requestedAlbumArtUrl << buffer->size();
@@ -1015,8 +1123,13 @@ bool MprisControlPlugin::sendAlbumArt(const QString &requestedAlbumArtUrl)
     return true;
 }
 
-void MprisControlPlugin::sendNowPlaying(bool force)
+void MprisControlPlugin::sendNowPlaying(bool force, const QString &player)
 {
+    if (!player.isEmpty() && sessionPlayer(player) && !(sessionPlayer(player)->isActive || sessionPlayer(player)->isSystem)) {
+        // A session player that does not own now playing only ever shows its frozen state.
+        sendFrozenPlayerBody(*sessionPlayer(player), force);
+        return;
+    }
     requestNowPlaying(force);
 }
 
@@ -1025,10 +1138,10 @@ void MprisControlPlugin::pollNowPlaying()
     requestNowPlaying(false);
 }
 
-QVariantMap MprisControlPlugin::defaultNowPlayingBody() const
+QVariantMap MprisControlPlugin::playerBody(const QString &playerName, bool controllable) const
 {
     QVariantMap body;
-    body[keyPlayer] = currentPlayerName();
+    body[keyPlayer] = playerName;
     body[QStringLiteral("title")] = QString();
     body[QStringLiteral("artist")] = QString();
     body[QStringLiteral("album")] = QString();
@@ -1037,12 +1150,12 @@ QVariantMap MprisControlPlugin::defaultNowPlayingBody() const
     body[keyLength] = -1;
     body[keyPos] = 0;
     body[keyIsPlaying] = m_hasLastKnownIsPlaying ? m_lastKnownIsPlaying : false;
-    const bool canControl = !m_mediaControlProgram.isEmpty() || MediaRemote::self().canSendCommands();
+    const bool canControl = controllable && (!m_mediaControlProgram.isEmpty() || MediaRemote::self().canSendCommands());
     body[QStringLiteral("canPause")] = canControl;
     body[QStringLiteral("canPlay")] = canControl;
     body[QStringLiteral("canGoNext")] = canControl;
     body[QStringLiteral("canGoPrevious")] = canControl;
-    body[QStringLiteral("canSeek")] = !m_mediaControlProgram.isEmpty();
+    body[QStringLiteral("canSeek")] = controllable && !m_mediaControlProgram.isEmpty();
     return body;
 }
 
@@ -1076,10 +1189,10 @@ NowPlayingInfo MprisControlPlugin::selectFallbackNowPlaying(const NowPlayingInfo
     return fallbackNowPlayingInfo(m_hasLastKnownIsPlaying, m_lastKnownIsPlaying);
 }
 
-void MprisControlPlugin::applyNowPlayingInfo(QVariantMap &body, const NowPlayingInfo &nowPlaying, qint64 sampleTime)
+void MprisControlPlugin::applyNowPlayingInfo(QVariantMap &body, const NowPlayingInfo &nowPlaying, qint64 sampleTime, SessionPlayer &entry)
 {
     rememberSupportedSource(nowPlaying);
-    updateAlbumArt(nowPlaying.artworkBytes.isEmpty() ? readAppleScriptArtworkFallback(nowPlaying.source) : nowPlaying.artworkBytes);
+    updateAlbumArt(nowPlaying.artworkBytes.isEmpty() ? readAppleScriptArtworkFallback(nowPlaying.source) : nowPlaying.artworkBytes, entry);
     body[keyTitle] = nowPlaying.title;
     body[keyArtist] = nowPlaying.artist;
     body[keyAlbum] = nowPlaying.album;
@@ -1093,27 +1206,27 @@ void MprisControlPlugin::applyNowPlayingInfo(QVariantMap &body, const NowPlaying
     }
 }
 
-void MprisControlPlugin::updateAlbumArt(const QByteArray &artworkBytes)
+void MprisControlPlugin::updateAlbumArt(const QByteArray &artworkBytes, SessionPlayer &entry)
 {
     if (artworkBytes.isEmpty() || artworkBytes.size() > maxAlbumArtBytes) {
-        if (!m_albumArtBytes.isEmpty()) {
-            m_albumArtBytes.clear();
-            m_albumArtHash.clear();
-            m_albumArtUrl.clear();
-            ++m_albumArtRevision;
+        if (!entry.artworkBytes.isEmpty()) {
+            entry.artworkBytes.clear();
+            entry.artworkHash.clear();
+            entry.artworkUrl.clear();
+            ++entry.artworkRevision;
         }
         return;
     }
 
     const QByteArray hash = QCryptographicHash::hash(artworkBytes, QCryptographicHash::Sha256).toHex();
-    if (hash == m_albumArtHash) {
+    if (hash == entry.artworkHash) {
         return;
     }
 
-    m_albumArtBytes = artworkBytes;
-    m_albumArtHash = hash;
-    m_albumArtUrl = QStringLiteral("kdeconnect://macos-nowplaying/art/%1/%2").arg(++m_albumArtRevision).arg(QString::fromLatin1(hash.left(16)));
-    qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Cached album art" << m_albumArtUrl << m_albumArtBytes.size();
+    entry.artworkBytes = artworkBytes;
+    entry.artworkHash = hash;
+    entry.artworkUrl = QStringLiteral("kdeconnect://macos-nowplaying/art/%1/%2").arg(++entry.artworkRevision).arg(QString::fromLatin1(hash.left(16)));
+    qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Cached album art for" << entry.name << entry.artworkUrl << entry.artworkBytes.size();
 }
 
 void MprisControlPlugin::updatePlaybackProgress(bool hasPosition, qlonglong position, bool hasPlaybackRate, double playbackRate, qint64 sampleTime)
@@ -1160,6 +1273,59 @@ void MprisControlPlugin::estimatePlaybackProgress(QVariantMap &body) const
     body[keyPos] = std::max<qlonglong>(0, position);
 }
 
+void MprisControlPlugin::sendLiveBodies(const NowPlayingInfo &nowPlaying, bool force)
+{
+    const qint64 sampleTime = QDateTime::currentMSecsSinceEpoch();
+
+    SessionPlayer *active = nullptr;
+    for (SessionPlayer &entry : m_sessionPlayers) {
+        if (entry.isActive && !entry.isSystem) {
+            active = &entry;
+            break;
+        }
+    }
+
+    if (active) {
+        QVariantMap body = playerBody(active->name, true);
+        applyNowPlayingInfo(body, nowPlaying, sampleTime, *active);
+        active->lastInfo = nowPlaying;
+        sendNowPlayingBody(body, force, true);
+    }
+
+    // The system player mirrors the elected application and is always controllable, even
+    // when the owning application cannot be identified.
+    SessionPlayer *system = systemPlayer();
+    QVariantMap systemBody = playerBody(system->name, true);
+    applyNowPlayingInfo(systemBody, nowPlaying, sampleTime, *system);
+    system->lastInfo = nowPlaying;
+    sendNowPlayingBody(systemBody, force, true);
+
+    // Session players that no longer own now playing keep their frozen state; the
+    // per-player body diff suppresses repeats.
+    for (SessionPlayer &entry : m_sessionPlayers) {
+        if (!entry.isSystem && !entry.isActive && entry.hasState) {
+            sendFrozenPlayerBody(entry, force);
+        }
+    }
+}
+
+void MprisControlPlugin::sendFrozenPlayerBody(const SessionPlayer &entry, bool force)
+{
+    if (!entry.hasState) {
+        return;
+    }
+    QVariantMap body = playerBody(entry.name, false);
+    body[keyTitle] = entry.lastInfo.title;
+    body[keyArtist] = entry.lastInfo.artist;
+    body[keyAlbum] = entry.lastInfo.album;
+    body[keyLength] = entry.lastInfo.length;
+    body[keyPos] = entry.lastInfo.pos;
+    if (entry.lastInfo.hasPlaybackRate) {
+        body[keyIsPlaying] = entry.lastInfo.isPlaying;
+    }
+    sendNowPlayingBody(body, force, false);
+}
+
 void MprisControlPlugin::requestNowPlaying(bool force)
 {
     // Prefer the media-control helper tier: it is the only source that works on macOS 15.4+
@@ -1167,14 +1333,12 @@ void MprisControlPlugin::requestNowPlaying(bool force)
     if (!m_mediaControlProgram.isEmpty()) {
         const NowPlayingInfo nowPlaying = queryMediaControl();
         if (nowPlaying.hasUsefulMetadata) {
-            const qint64 sampleTime = QDateTime::currentMSecsSinceEpoch();
-            QVariantMap body = defaultNowPlayingBody();
-            applyNowPlayingInfo(body, nowPlaying, sampleTime);
+            updateActivePlayer(nowPlaying);
             if (!m_reportedNowPlayingInfo && nowPlaying.source != QStringLiteral("safe-default")) {
                 qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Now-playing metadata available from" << nowPlaying.source;
                 m_reportedNowPlayingInfo = true;
             }
-            sendNowPlayingBody(body, force);
+            sendLiveBodies(nowPlaying, force);
             return;
         }
     }
@@ -1187,9 +1351,9 @@ void MprisControlPlugin::requestNowPlaying(bool force)
     if (!MediaRemote::self().canReadNowPlayingInfo()) {
         const NowPlayingInfo nowPlaying = selectFallbackNowPlaying(queryAppleScriptFallbacks(m_lastSupportedSource), queryGenericFallback());
         const qint64 sampleTime = QDateTime::currentMSecsSinceEpoch();
-        QVariantMap body = defaultNowPlayingBody();
-        applyNowPlayingInfo(body, nowPlaying, sampleTime);
-        sendNowPlayingBody(body, force);
+        QVariantMap body = playerBody(nowPlayingPlayer(), true);
+        applyNowPlayingInfo(body, nowPlaying, sampleTime, *systemPlayer());
+        sendNowPlayingBody(body, force, true);
         return;
     }
 
@@ -1209,9 +1373,9 @@ void MprisControlPlugin::requestNowPlaying(bool force)
             m_reportedNowPlayingTimeout = true;
         }
         const NowPlayingInfo fallback = selectFallbackNowPlaying(queryAppleScriptFallbacks(m_lastSupportedSource), queryGenericFallback());
-        QVariantMap body = defaultNowPlayingBody();
-        applyNowPlayingInfo(body, fallback, QDateTime::currentMSecsSinceEpoch());
-        sendNowPlayingBody(body, forceSend);
+        QVariantMap body = playerBody(nowPlayingPlayer(), true);
+        applyNowPlayingInfo(body, fallback, QDateTime::currentMSecsSinceEpoch(), *systemPlayer());
+        sendNowPlayingBody(body, forceSend, true);
     });
 
     MediaRemote::self().getNowPlayingInfoAsync(^(CFDictionaryRef info) {
@@ -1236,9 +1400,9 @@ void MprisControlPlugin::requestNowPlaying(bool force)
                 guard->m_nowPlayingRequestInFlight = false;
                 const bool forceSend = guard->m_forceSendAfterNowPlayingReply;
                 guard->m_forceSendAfterNowPlayingReply = false;
-                QVariantMap body = guard->defaultNowPlayingBody();
-                guard->applyNowPlayingInfo(body, fallback, sampleTime);
-                guard->sendNowPlayingBody(body, forceSend);
+                QVariantMap body = guard->playerBody(nowPlayingPlayer(), true);
+                guard->applyNowPlayingInfo(body, fallback, sampleTime, *guard->systemPlayer());
+                guard->sendNowPlayingBody(body, forceSend, true);
             }, Qt::QueuedConnection);
             return;
         }
@@ -1255,31 +1419,37 @@ void MprisControlPlugin::requestNowPlaying(bool force)
             const bool forceSend = guard->m_forceSendAfterNowPlayingReply;
             guard->m_forceSendAfterNowPlayingReply = false;
 
-            QVariantMap body = guard->defaultNowPlayingBody();
-            guard->applyNowPlayingInfo(body, nowPlaying, sampleTime);
+            QVariantMap body = guard->playerBody(nowPlayingPlayer(), true);
+            guard->applyNowPlayingInfo(body, nowPlaying, sampleTime, *guard->systemPlayer());
             if (!guard->m_reportedNowPlayingInfo && nowPlaying.source != QStringLiteral("safe-default")) {
                 qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Now-playing metadata available from" << nowPlaying.source;
                 guard->m_reportedNowPlayingInfo = true;
             }
 
-            guard->sendNowPlayingBody(body, forceSend);
+            guard->sendNowPlayingBody(body, forceSend, true);
         }, Qt::QueuedConnection);
     });
 }
 
-void MprisControlPlugin::sendNowPlayingBody(QVariantMap body, bool force)
+void MprisControlPlugin::sendNowPlayingBody(QVariantMap body, bool force, bool estimateProgress)
 {
-    body[keyAlbumArtUrl] = m_albumArtUrl;
+    SessionPlayer *entry = sessionPlayer(body.value(keyPlayer).toString());
+    if (!entry) {
+        return;
+    }
+    body[keyAlbumArtUrl] = entry->artworkUrl;
     body[QStringLiteral("supportAlbumArtPayload")] = true;
-    estimatePlaybackProgress(body);
-    if (!force && m_hasLastNowPlayingBody && body == m_lastNowPlayingBody) {
+    if (estimateProgress) {
+        estimatePlaybackProgress(body);
+    }
+    if (!force && entry->hasState && body == entry->lastBody) {
         return;
     }
 
     NetworkPacket np(PACKET_TYPE_MPRIS, body);
     sendPacket(np);
-    m_lastNowPlayingBody = body;
-    m_hasLastNowPlayingBody = true;
+    entry->lastBody = body;
+    entry->hasState = true;
 }
 
 #include "moc_mpriscontrolplugin-macos.cpp"
