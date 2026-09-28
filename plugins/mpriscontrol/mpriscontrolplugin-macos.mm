@@ -717,7 +717,10 @@ void MprisControlPlugin::receivePacket(const NetworkPacket &np)
     }
 
     const QString player = np.get<QString>(keyPlayer);
-    const bool knownPlayer = player.isEmpty() || player == currentPlayerName() || player == QLatin1String("Now Playing");
+    // Accept the previous player name as well: the remote may still address the old
+    // entry until it processes the updated player list.
+    const bool knownPlayer =
+        player.isEmpty() || player == currentPlayerName() || player == m_previousPlayerName || player == QLatin1String("Now Playing");
 
     if (np.get<bool>(QStringLiteral("requestPlayerList"))) {
         sendPlayerList();
@@ -901,9 +904,16 @@ void MprisControlPlugin::updateActivePlayer(const NowPlayingInfo &nowPlaying)
     }
 
     m_activeAppBundleIdentifier = nowPlaying.bundleIdentifier;
+    const QString previousName = currentPlayerName();
     m_activePlayerName = applicationDisplayName(nowPlaying.bundleIdentifier, nowPlaying.processIdentifier);
+    m_previousPlayerName = previousName;
     m_lastSupportedSource.clear();
     qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Active player is now" << m_activePlayerName << nowPlaying.bundleIdentifier;
+
+    // Re-announce the player list so the remote replaces the old entry. Without this the
+    // remote ignores now-playing updates for the renamed player and keeps addressing
+    // commands to the stale name.
+    sendPlayerList();
 }
 
 NowPlayingInfo MprisControlPlugin::queryMediaControl()

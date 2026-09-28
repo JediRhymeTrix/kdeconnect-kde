@@ -69,6 +69,7 @@ private:
     QString m_lastSupportedSource;
     QString m_mediaControlProgram;
     QString m_activePlayerName;
+    QString m_previousPlayerName;
     QString m_activeAppBundleIdentifier;
     QString m_mediaControlArtworkItemId;
     bool m_mediaControlArtworkValid = false;
