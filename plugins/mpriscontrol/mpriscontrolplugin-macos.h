@@ -36,6 +36,11 @@ private:
     bool sendAlbumArt(const QString &requestedAlbumArtUrl);
     QVariantMap defaultNowPlayingBody() const;
     bool handleAction(const QString &action);
+    bool handleSeekPacket(const NetworkPacket &np);
+    QString currentPlayerName() const;
+    bool sendMediaControlCommand(const QStringList &arguments);
+    NowPlayingInfo queryMediaControl();
+    void updateActivePlayer(const NowPlayingInfo &nowPlaying);
     void rememberSupportedSource(const NowPlayingInfo &nowPlaying);
     NowPlayingInfo selectFallbackNowPlaying(const NowPlayingInfo &supportedApp, const NowPlayingInfo &genericFallback) const;
     void applyNowPlayingInfo(QVariantMap &body, const NowPlayingInfo &nowPlaying, qint64 sampleTime);
@@ -62,6 +67,12 @@ private:
     QByteArray m_albumArtHash;
     QString m_albumArtUrl;
     QString m_lastSupportedSource;
+    QString m_mediaControlProgram;
+    QString m_activePlayerName;
+    QString m_activeAppBundleIdentifier;
+    QString m_mediaControlArtworkItemId;
+    bool m_mediaControlArtworkValid = false;
+    bool m_reportedMediaControlFailure = false;
     QVariantMap m_lastNowPlayingBody;
     QTimer *m_pollTimer = nullptr;
 };

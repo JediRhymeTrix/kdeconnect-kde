@@ -21,12 +21,15 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QDateTime>
+#include <QFileInfo>
+#include <QStandardPaths>
 
 #include <cmath>
 #include <dlfcn.h>
 #include <algorithm>
 
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 
 K_PLUGIN_CLASS_WITH_JSON(MprisControlPlugin, "kdeconnect_mpriscontrol.json")
 
@@ -44,6 +47,9 @@ struct NowPlayingInfo {
     bool hasUsefulMetadata = false;
     QByteArray artworkBytes;
     QString source;
+    QString bundleIdentifier;
+    QString contentItemIdentifier;
+    qint64 processIdentifier = 0;
 };
 
 namespace
@@ -63,6 +69,9 @@ constexpr int nowPlayingTimeoutMs = 1000;
 constexpr int helperTimeoutMs = 500;
 constexpr int appleScriptTimeoutMs = 900;
 constexpr int processCleanupTimeoutMs = 100;
+constexpr int mediaControlGetTimeoutMs = 500;
+constexpr int mediaControlArtworkTimeoutMs = 1000;
+constexpr int mediaControlCommandTimeoutMs = 500;
 constexpr qsizetype maxAlbumArtBytes = 5 * 1024 * 1024;
 constexpr double minimumPlayingRate = 0.01;
 
@@ -566,6 +575,75 @@ NowPlayingInfo queryPlatformHelperFallback()
     return result;
 }
 
+// Locates the external media-control helper (https://github.com/ungive/media-control), which reads
+// and controls now-playing media on macOS 15.4+ where direct MediaRemote access is gated for
+// third-party processes. Returns an empty string when unavailable.
+QString mediaControlProgramFromEnvironment()
+{
+    const QString overridePath = qEnvironmentVariable("KDECONNECT_MACOS_MEDIA_CONTROL");
+    if (!overridePath.isEmpty()) {
+        return QFileInfo::exists(overridePath) ? overridePath : QString();
+    }
+    QString program = QStandardPaths::findExecutable(QStringLiteral("media-control"));
+    if (program.isEmpty()) {
+        const QStringList fallbackLocations = {QStringLiteral("/opt/homebrew/bin/media-control"), QStringLiteral("/usr/local/bin/media-control")};
+        for (const QString &location : fallbackLocations) {
+            if (QFileInfo::exists(location)) {
+                program = location;
+                break;
+            }
+        }
+    }
+    return program;
+}
+
+// A human readable name for the app that currently owns now playing.
+QString applicationDisplayName(const QString &bundleIdentifier, qint64 processIdentifier)
+{
+    if (processIdentifier > 0) {
+        NSRunningApplication *application = [NSRunningApplication runningApplicationWithProcessIdentifier:static_cast<pid_t>(processIdentifier)];
+        NSString *name = application.localizedName;
+        if (name.length > 0) {
+            return QString::fromNSString(name);
+        }
+    }
+    const QString fallback = bundleIdentifier.section(QLatin1Char('.'), -1);
+    return fallback.isEmpty() ? QStringLiteral("Now Playing") : fallback;
+}
+
+// Parses the JSON emitted by "media-control get". Times are seconds, positions map to
+// NowPlayingInfo milliseconds.
+void parseMediaControlObject(const QJsonObject &object, NowPlayingInfo &result)
+{
+    result.title = object.value(keyTitle).toString();
+    result.artist = object.value(keyArtist).toString();
+    result.album = object.value(keyAlbum).toString();
+
+    const double duration = object.value(QStringLiteral("duration")).toDouble(-1);
+    if (duration >= 0) {
+        result.length = secondsToMilliseconds(duration, -1);
+    }
+    if (object.contains(QStringLiteral("elapsedTime"))) {
+        result.pos = secondsToMilliseconds(object.value(QStringLiteral("elapsedTime")).toDouble(0.0));
+        result.hasPosition = true;
+    }
+
+    result.isPlaying = object.value(QStringLiteral("playing")).toBool(false);
+    result.hasPlaybackRate = true;
+    result.playbackRate = object.value(keyPlaybackRate).toDouble(result.isPlaying ? 1.0 : 0.0);
+
+    result.bundleIdentifier = object.value(QStringLiteral("bundleIdentifier")).toString();
+    result.contentItemIdentifier = object.value(QStringLiteral("contentItemIdentifier")).toString();
+    result.processIdentifier = static_cast<qint64>(object.value(QStringLiteral("processIdentifier")).toDouble(0.0));
+
+    result.hasDescriptiveMetadata =
+        !result.title.isEmpty() || !result.artist.isEmpty() || !result.album.isEmpty() || result.length >= 0 || result.hasPosition;
+    result.hasUsefulMetadata = result.hasDescriptiveMetadata || result.hasPlaybackRate;
+    if (result.hasUsefulMetadata) {
+        result.source = QStringLiteral("media-control");
+    }
+}
+
 NowPlayingInfo fallbackNowPlayingInfo(bool hasLastKnownIsPlaying, bool lastKnownIsPlaying)
 {
     NowPlayingInfo result;
@@ -607,6 +685,21 @@ MprisControlPlugin::MprisControlPlugin(QObject *parent, const QVariantList &args
     @autoreleasepool {
         MediaRemote::self();
     }
+
+    m_mediaControlProgram = mediaControlProgramFromEnvironment();
+    if (!m_mediaControlProgram.isEmpty()) {
+        QProcess process;
+        process.setProgram(m_mediaControlProgram);
+        process.setArguments({QStringLiteral("test")});
+        process.start();
+        if (!process.waitForFinished(mediaControlGetTimeoutMs) || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+            process.kill();
+            process.waitForFinished(processCleanupTimeoutMs);
+            qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "media-control helper found but not functional on this system; using direct MediaRemote access";
+            m_mediaControlProgram.clear();
+        }
+    }
+
     sendPlayerList();
     sendNowPlaying(true);
 
@@ -624,7 +717,7 @@ void MprisControlPlugin::receivePacket(const NetworkPacket &np)
     }
 
     const QString player = np.get<QString>(keyPlayer);
-    const bool knownPlayer = player.isEmpty() || player == nowPlayingPlayer();
+    const bool knownPlayer = player.isEmpty() || player == currentPlayerName() || player == QLatin1String("Now Playing");
 
     if (np.get<bool>(QStringLiteral("requestPlayerList"))) {
         sendPlayerList();
@@ -647,11 +740,12 @@ void MprisControlPlugin::receivePacket(const NetworkPacket &np)
         handledAction = handleAction(np.get<QString>(QStringLiteral("action")));
     }
 
-    // MediaRemote has a private SeekToPlaybackPosition command, but this backend has no locally verified,
-    // safe argument dictionary contract for it yet. Keep canSeek=false and ignore seek packets until validated.
-    if ((np.has(QStringLiteral("Seek")) || np.has(QStringLiteral("SetPosition"))) && !m_reportedSeekUnsupported) {
-        qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Ignoring seek request: no safely verified MediaRemote seek implementation is available";
-        m_reportedSeekUnsupported = true;
+    // Seek is delivered through the media-control helper; direct MediaRemote has a private
+    // SeekToPlaybackPosition command, but this backend has no locally verified, safe argument
+    // dictionary contract for it.
+    const bool handledSeek = handleSeekPacket(np);
+    if (handledSeek && !handledAction) {
+        sendNowPlaying();
     }
 
     if (handledAction) {
@@ -664,8 +758,13 @@ void MprisControlPlugin::receivePacket(const NetworkPacket &np)
 
 bool MprisControlPlugin::handleAction(const QString &action)
 {
-    auto sendCommand = [this](int command) {
-        const bool sent = MediaRemote::self().sendCommand(command);
+    // Commands prefer the external media-control helper (works on macOS 15.4+ where direct
+    // MediaRemote command delivery is gated); direct MediaRemote remains as fallback.
+    auto sendCommand = [this](const char *helperCommand, int mediaRemoteCommand) {
+        if (!m_mediaControlProgram.isEmpty() && sendMediaControlCommand(QStringList{QString::fromLatin1(helperCommand)})) {
+            return true;
+        }
+        const bool sent = MediaRemote::self().sendCommand(mediaRemoteCommand);
         if (!sent && !m_reportedCommandUnavailable) {
             qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Ignoring media command: MediaRemote command symbol unavailable";
             m_reportedCommandUnavailable = true;
@@ -681,7 +780,7 @@ bool MprisControlPlugin::handleAction(const QString &action)
     };
 
     if (action == QStringLiteral("Play")) {
-        sendCommand(commandPlay);
+        sendCommand("play", commandPlay);
         m_lastKnownIsPlaying = true;
         m_hasLastKnownIsPlaying = true;
         m_lastPlaybackRate = 1.0;
@@ -693,7 +792,7 @@ bool MprisControlPlugin::handleAction(const QString &action)
 
     if (action == QStringLiteral("Pause") || action == QStringLiteral("Stop")) {
         freezeProgress();
-        sendCommand(commandPause);
+        sendCommand("pause", commandPause);
         m_lastKnownIsPlaying = false;
         m_hasLastKnownIsPlaying = true;
         m_lastPlaybackRate = 0.0;
@@ -702,7 +801,7 @@ bool MprisControlPlugin::handleAction(const QString &action)
 
     if (action == QStringLiteral("PlayPause")) {
         freezeProgress();
-        sendCommand(commandTogglePlayPause);
+        sendCommand("toggle-play-pause", commandTogglePlayPause);
         m_lastKnownIsPlaying = m_hasLastKnownIsPlaying ? !m_lastKnownIsPlaying : true;
         m_hasLastKnownIsPlaying = true;
         m_lastPlaybackRate = m_lastKnownIsPlaying ? 1.0 : 0.0;
@@ -710,13 +809,13 @@ bool MprisControlPlugin::handleAction(const QString &action)
     }
 
     if (action == QStringLiteral("Next")) {
-        sendCommand(commandNextTrack);
+        sendCommand("next-track", commandNextTrack);
         m_hasLastPosition = false;
         return true;
     }
 
     if (action == QStringLiteral("Previous")) {
-        sendCommand(commandPreviousTrack);
+        sendCommand("previous-track", commandPreviousTrack);
         m_hasLastPosition = false;
         return true;
     }
@@ -724,10 +823,160 @@ bool MprisControlPlugin::handleAction(const QString &action)
     return false;
 }
 
+QString MprisControlPlugin::currentPlayerName() const
+{
+    return m_activePlayerName.isEmpty() ? QStringLiteral("Now Playing") : m_activePlayerName;
+}
+
+bool MprisControlPlugin::sendMediaControlCommand(const QStringList &arguments)
+{
+    if (m_mediaControlProgram.isEmpty()) {
+        return false;
+    }
+
+    QProcess process;
+    process.setProgram(m_mediaControlProgram);
+    process.setArguments(arguments);
+    process.start();
+    if (!process.waitForFinished(mediaControlCommandTimeoutMs) || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        process.kill();
+        process.waitForFinished(processCleanupTimeoutMs);
+        if (!m_reportedMediaControlFailure) {
+            qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "media-control helper command failed:" << arguments;
+            m_reportedMediaControlFailure = true;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool MprisControlPlugin::handleSeekPacket(const NetworkPacket &np)
+{
+    const bool hasSetPosition = np.has(QStringLiteral("SetPosition"));
+    const bool hasSeek = np.has(QStringLiteral("Seek"));
+    if (!hasSetPosition && !hasSeek) {
+        return false;
+    }
+
+    if (m_mediaControlProgram.isEmpty()) {
+        if (!m_reportedSeekUnsupported) {
+            qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Ignoring seek request: no verified seek implementation available";
+            m_reportedSeekUnsupported = true;
+        }
+        return false;
+    }
+
+    qlonglong targetMs = 0;
+    if (hasSetPosition) {
+        targetMs = np.get<qlonglong>(QStringLiteral("SetPosition"), 0);
+    } else {
+        QVariantMap body = defaultNowPlayingBody();
+        estimatePlaybackProgress(body);
+        targetMs = body.value(keyPos).toLongLong() + np.get<qlonglong>(QStringLiteral("Seek"), 0);
+    }
+    targetMs = std::max<qlonglong>(0, targetMs);
+    const qlonglong length = m_lastNowPlayingBody.value(keyLength, -1).toLongLong();
+    if (length >= 0) {
+        targetMs = std::min(targetMs, length);
+    }
+
+    if (!sendMediaControlCommand({QStringLiteral("seek"), QString::number(targetMs / 1000.0, 'f', 3)})) {
+        if (!m_reportedSeekUnsupported) {
+            qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Ignoring seek request: media-control seek failed";
+            m_reportedSeekUnsupported = true;
+        }
+        return false;
+    }
+
+    m_lastPosition = targetMs;
+    m_lastPositionSampleTime = QDateTime::currentMSecsSinceEpoch();
+    m_hasLastPosition = true;
+    return true;
+}
+
+void MprisControlPlugin::updateActivePlayer(const NowPlayingInfo &nowPlaying)
+{
+    if (nowPlaying.bundleIdentifier.isEmpty() || nowPlaying.bundleIdentifier == m_activeAppBundleIdentifier) {
+        return;
+    }
+
+    m_activeAppBundleIdentifier = nowPlaying.bundleIdentifier;
+    m_activePlayerName = applicationDisplayName(nowPlaying.bundleIdentifier, nowPlaying.processIdentifier);
+    m_lastSupportedSource.clear();
+    qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Active player is now" << m_activePlayerName << nowPlaying.bundleIdentifier;
+}
+
+NowPlayingInfo MprisControlPlugin::queryMediaControl()
+{
+    NowPlayingInfo result;
+    if (m_mediaControlProgram.isEmpty()) {
+        return result;
+    }
+
+    QProcess process;
+    process.setProgram(m_mediaControlProgram);
+    process.setArguments({QStringLiteral("get"), QStringLiteral("--no-artwork")});
+    process.start();
+    if (!process.waitForFinished(mediaControlGetTimeoutMs) || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        process.kill();
+        process.waitForFinished(processCleanupTimeoutMs);
+        if (!m_reportedMediaControlFailure) {
+            qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "media-control metadata query failed";
+            m_reportedMediaControlFailure = true;
+        }
+        return result;
+    }
+
+    const QJsonDocument document = QJsonDocument::fromJson(process.readAllStandardOutput().trimmed());
+    if (!document.isObject()) {
+        if (!m_reportedMediaControlFailure) {
+            qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "media-control metadata query returned no JSON object";
+            m_reportedMediaControlFailure = true;
+        }
+        return result;
+    }
+    parseMediaControlObject(document.object(), result);
+    if (!result.hasUsefulMetadata) {
+        return result;
+    }
+
+    updateActivePlayer(result);
+
+    // Artwork is heavy; fetch it only when the playing item changed and keep the cached bytes otherwise.
+    if (m_mediaControlArtworkValid && result.contentItemIdentifier == m_mediaControlArtworkItemId) {
+        result.artworkBytes = m_albumArtBytes;
+        return result;
+    }
+
+    NowPlayingInfo artworkInfo;
+    QProcess artworkProcess;
+    artworkProcess.setProgram(m_mediaControlProgram);
+    artworkProcess.setArguments({QStringLiteral("get")});
+    artworkProcess.start();
+    if (artworkProcess.waitForFinished(mediaControlArtworkTimeoutMs) && artworkProcess.exitStatus() == QProcess::NormalExit
+        && artworkProcess.exitCode() == 0) {
+        const QJsonDocument artworkDocument = QJsonDocument::fromJson(artworkProcess.readAllStandardOutput().trimmed());
+        if (artworkDocument.isObject()) {
+            parseMediaControlObject(artworkDocument.object(), artworkInfo);
+            const QByteArray artwork = QByteArray::fromBase64(artworkDocument.object().value(QStringLiteral("artworkData")).toString().toLatin1());
+            if (!artwork.isEmpty() && artwork.size() <= maxAlbumArtBytes) {
+                result.artworkBytes = artwork;
+            }
+        }
+    } else {
+        artworkProcess.kill();
+        artworkProcess.waitForFinished(processCleanupTimeoutMs);
+    }
+
+    m_mediaControlArtworkItemId = result.contentItemIdentifier;
+    m_mediaControlArtworkValid = true;
+    return result;
+}
+
 void MprisControlPlugin::sendPlayerList()
 {
     NetworkPacket np(PACKET_TYPE_MPRIS);
-    np.set(QStringLiteral("playerList"), QStringList{nowPlayingPlayer()});
+    np.set(QStringLiteral("playerList"), QStringList{currentPlayerName()});
     np.set(QStringLiteral("supportAlbumArtPayload"), true);
     sendPacket(np);
 }
@@ -748,7 +997,7 @@ bool MprisControlPlugin::sendAlbumArt(const QString &requestedAlbumArtUrl)
 
     NetworkPacket answer(PACKET_TYPE_MPRIS);
     answer.set(QStringLiteral("transferringAlbumArt"), true);
-    answer.set(keyPlayer, nowPlayingPlayer());
+    answer.set(keyPlayer, currentPlayerName());
     answer.set(keyAlbumArtUrl, requestedAlbumArtUrl);
     answer.setPayload(buffer, buffer->size());
     qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Sending album art payload" << requestedAlbumArtUrl << buffer->size();
@@ -769,7 +1018,7 @@ void MprisControlPlugin::pollNowPlaying()
 QVariantMap MprisControlPlugin::defaultNowPlayingBody() const
 {
     QVariantMap body;
-    body[keyPlayer] = nowPlayingPlayer();
+    body[keyPlayer] = currentPlayerName();
     body[QStringLiteral("title")] = QString();
     body[QStringLiteral("artist")] = QString();
     body[QStringLiteral("album")] = QString();
@@ -778,12 +1027,12 @@ QVariantMap MprisControlPlugin::defaultNowPlayingBody() const
     body[keyLength] = -1;
     body[keyPos] = 0;
     body[keyIsPlaying] = m_hasLastKnownIsPlaying ? m_lastKnownIsPlaying : false;
-    const bool canSendCommands = MediaRemote::self().canSendCommands();
-    body[QStringLiteral("canPause")] = canSendCommands;
-    body[QStringLiteral("canPlay")] = canSendCommands;
-    body[QStringLiteral("canGoNext")] = canSendCommands;
-    body[QStringLiteral("canGoPrevious")] = canSendCommands;
-    body[QStringLiteral("canSeek")] = false;
+    const bool canControl = !m_mediaControlProgram.isEmpty() || MediaRemote::self().canSendCommands();
+    body[QStringLiteral("canPause")] = canControl;
+    body[QStringLiteral("canPlay")] = canControl;
+    body[QStringLiteral("canGoNext")] = canControl;
+    body[QStringLiteral("canGoPrevious")] = canControl;
+    body[QStringLiteral("canSeek")] = !m_mediaControlProgram.isEmpty();
     return body;
 }
 
@@ -903,6 +1152,23 @@ void MprisControlPlugin::estimatePlaybackProgress(QVariantMap &body) const
 
 void MprisControlPlugin::requestNowPlaying(bool force)
 {
+    // Prefer the media-control helper tier: it is the only source that works on macOS 15.4+
+    // where direct MediaRemote reads are gated for third-party processes.
+    if (!m_mediaControlProgram.isEmpty()) {
+        const NowPlayingInfo nowPlaying = queryMediaControl();
+        if (nowPlaying.hasUsefulMetadata) {
+            const qint64 sampleTime = QDateTime::currentMSecsSinceEpoch();
+            QVariantMap body = defaultNowPlayingBody();
+            applyNowPlayingInfo(body, nowPlaying, sampleTime);
+            if (!m_reportedNowPlayingInfo && nowPlaying.source != QStringLiteral("safe-default")) {
+                qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Now-playing metadata available from" << nowPlaying.source;
+                m_reportedNowPlayingInfo = true;
+            }
+            sendNowPlayingBody(body, force);
+            return;
+        }
+    }
+
     if (m_nowPlayingRequestInFlight) {
         m_forceSendAfterNowPlayingReply = m_forceSendAfterNowPlayingReply || force;
         return;

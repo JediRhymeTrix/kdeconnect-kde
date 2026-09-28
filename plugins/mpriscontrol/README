@@ -33,6 +33,15 @@ frameworks or symbols degrade to a single safe "Now Playing" player with limited
 metadata from Music/Spotify AppleScript or an optional helper named by
 `KDECONNECT_MACOS_MEDIAREMOTE_HELPER` (JSON on stdout). MediaRemote is private
 API: controls/metadata may be gated by macOS entitlements, can no-op after OS
-updates, and may affect signing/notarization review. Seek remains disabled until
-the private command contract is verified.
+updates, and may affect signing/notarization review.
+
+Since macOS 15.4 Apple gates direct MediaRemote reads and, as of macOS 27,
+command delivery for third-party processes. When the external
+`media-control` helper (https://github.com/ungive/media-control, Homebrew:
+`brew install media-control`) is present, the backend uses it as the preferred
+generic source for metadata, artwork, player identity and playback commands,
+including seek. Its path can be overridden with `KDECONNECT_MACOS_MEDIA_CONTROL`.
+It names the reported player after the application that currently owns
+now playing (for example "Sonora"); without it the generic "Now Playing"
+player is reported.
 
