@@ -327,6 +327,7 @@ NowPlayingInfo runAppleScript(const QString &script, const QString &source)
 // the active metadata source. Adding a player = adding a table entry.
 struct ScriptablePlayer {
     const char *appName;
+    const char *bundleIdentifier;
     double durationMultiplier;
     QByteArray (*artworkReader)();
 };
@@ -335,9 +336,37 @@ QByteArray readMusicArtworkFallback();
 QByteArray readSpotifyArtworkFallback();
 
 static const ScriptablePlayer scriptablePlayers[] = {
-    {"Music", 1000, &readMusicArtworkFallback},
-    {"Spotify", 1, &readSpotifyArtworkFallback},
+    {"Music", "com.apple.Music", 1000, &readMusicArtworkFallback},
+    {"Spotify", "com.spotify.client", 1, &readSpotifyArtworkFallback},
 };
+
+const ScriptablePlayer *scriptablePlayerForBundleIdentifier(const QString &bundleIdentifier)
+{
+    for (const ScriptablePlayer &player : scriptablePlayers) {
+        if (bundleIdentifier == QLatin1String(player.bundleIdentifier)) {
+            return &player;
+        }
+    }
+    return nullptr;
+}
+
+// Scriptable applications can be controlled with AppleScript regardless of which
+// application currently owns now playing. Commands are limited to play/pause and
+// track navigation: those are the ones verified in both applications' dictionaries.
+bool sendScriptableCommand(const ScriptablePlayer &player, const QString &command)
+{
+    QProcess process;
+    process.setProgram(QStringLiteral("/usr/bin/osascript"));
+    process.setArguments({QStringLiteral("-e"),
+                          QStringLiteral("tell application \"%1\" to %2").arg(QString::fromLatin1(player.appName), command)});
+    process.start();
+    if (!process.waitForFinished(appleScriptTimeoutMs) || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        process.kill();
+        process.waitForFinished(processCleanupTimeoutMs);
+        return false;
+    }
+    return true;
+}
 
 NowPlayingInfo queryAppleScriptFallbacks(const QString &preferredSource)
 {
@@ -745,7 +774,11 @@ bool MprisControlPlugin::handleAction(const QString &action, const QString &play
     // view-only and report no control capabilities.
     SessionPlayer *entry = sessionPlayer(player);
     const bool controlElected = player.isEmpty() || (entry && (entry->isSystem || entry->isActive));
-    if (!controlElected) {
+    // Scriptable applications (see scriptablePlayers) can be commanded directly with
+    // AppleScript even when another application owns now playing; state then refreshes
+    // through the poll once they take over now playing again.
+    const ScriptablePlayer *scriptable = (controlElected || !entry) ? nullptr : scriptablePlayerForBundleIdentifier(entry->bundleIdentifier);
+    if (!controlElected && !scriptable) {
         qCDebug(KDECONNECT_PLUGIN_MPRISCONTROL) << "Ignoring command for player that does not own now playing:" << player;
         return false;
     }
@@ -772,6 +805,9 @@ bool MprisControlPlugin::handleAction(const QString &action, const QString &play
     };
 
     if (action == QStringLiteral("Play")) {
+        if (scriptable) {
+            return sendScriptableCommand(*scriptable, QStringLiteral("play"));
+        }
         sendCommand("play", commandPlay);
         m_lastKnownIsPlaying = true;
         m_hasLastKnownIsPlaying = true;
@@ -783,6 +819,9 @@ bool MprisControlPlugin::handleAction(const QString &action, const QString &play
     }
 
     if (action == QStringLiteral("Pause") || action == QStringLiteral("Stop")) {
+        if (scriptable) {
+            return sendScriptableCommand(*scriptable, QStringLiteral("pause"));
+        }
         freezeProgress();
         sendCommand("pause", commandPause);
         m_lastKnownIsPlaying = false;
@@ -792,6 +831,9 @@ bool MprisControlPlugin::handleAction(const QString &action, const QString &play
     }
 
     if (action == QStringLiteral("PlayPause")) {
+        if (scriptable) {
+            return sendScriptableCommand(*scriptable, QStringLiteral("playpause"));
+        }
         freezeProgress();
         sendCommand("toggle-play-pause", commandTogglePlayPause);
         m_lastKnownIsPlaying = m_hasLastKnownIsPlaying ? !m_lastKnownIsPlaying : true;
@@ -801,12 +843,18 @@ bool MprisControlPlugin::handleAction(const QString &action, const QString &play
     }
 
     if (action == QStringLiteral("Next")) {
+        if (scriptable) {
+            return sendScriptableCommand(*scriptable, QStringLiteral("next track"));
+        }
         sendCommand("next-track", commandNextTrack);
         m_hasLastPosition = false;
         return true;
     }
 
     if (action == QStringLiteral("Previous")) {
+        if (scriptable) {
+            return sendScriptableCommand(*scriptable, QStringLiteral("previous track"));
+        }
         sendCommand("previous-track", commandPreviousTrack);
         m_hasLastPosition = false;
         return true;
@@ -1314,7 +1362,9 @@ void MprisControlPlugin::sendFrozenPlayerBody(const SessionPlayer &entry, bool f
     if (!entry.hasState) {
         return;
     }
-    QVariantMap body = playerBody(entry.name, false);
+    // Scriptable applications keep controllable buttons: AppleScript can reach them
+    // directly even when another application owns now playing.
+    QVariantMap body = playerBody(entry.name, scriptablePlayerForBundleIdentifier(entry.bundleIdentifier) != nullptr);
     body[keyTitle] = entry.lastInfo.title;
     body[keyArtist] = entry.lastInfo.artist;
     body[keyAlbum] = entry.lastInfo.album;

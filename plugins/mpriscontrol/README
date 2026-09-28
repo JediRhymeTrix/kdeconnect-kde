@@ -43,5 +43,9 @@ generic source for metadata, artwork, player identity and playback commands,
 including seek. Its path can be overridden with `KDECONNECT_MACOS_MEDIA_CONTROL`.
 It names the reported player after the application that currently owns
 now playing (for example "Sonora"); without it the generic "Now Playing"
-player is reported.
+player is reported. Every application that owned now playing during the
+session is listed as its own player with its last known state. Inactive
+entries stay controllable only when the application is scriptable
+(Music, Spotify), since macOS otherwise routes third-party commands to
+the application that currently owns now playing.
 
