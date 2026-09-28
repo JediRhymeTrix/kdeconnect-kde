@@ -332,10 +332,27 @@ NowPlayingInfo runAppleScript(const QString &script, const QString &source)
     return result;
 }
 
+// One combined AppleScript query probes these scriptable players. durationMultiplier converts
+// each app's native track duration to milliseconds. Artwork readers only run when that app is
+// the active metadata source. Adding a player = adding a table entry.
+struct ScriptablePlayer {
+    const char *appName;
+    double durationMultiplier;
+    QByteArray (*artworkReader)();
+};
+
+QByteArray readMusicArtworkFallback();
+QByteArray readSpotifyArtworkFallback();
+
+static const ScriptablePlayer scriptablePlayers[] = {
+    {"Music", 1000, &readMusicArtworkFallback},
+    {"Spotify", 1, &readSpotifyArtworkFallback},
+};
+
 NowPlayingInfo queryAppleScriptFallbacks(const QString &preferredSource)
 {
     static const QString script = QStringLiteral(R"JS(
-function read(appName, durationMultiplier) {
+
   try {
     const app = Application(appName);
     app.includeStandardAdditions = true;
@@ -360,15 +377,22 @@ function read(appName, durationMultiplier) {
     return item;
   } catch (e) { return null; }
 }
-const candidates = [read('Music', 1000), read('Spotify', 1)].filter(Boolean);
+const candidates = [%2].filter(Boolean);
 const playing = candidates.filter(item => item.isPlaying);
 const preferred = %1;
 const preferredPaused = candidates.filter(item => item.source === preferred);
 JSON.stringify(playing[0] || preferredPaused[0] || candidates[0] || {});
 )JS");
+    QString candidateCalls;
+    for (const ScriptablePlayer &player : scriptablePlayers) {
+        if (!candidateCalls.isEmpty()) {
+            candidateCalls += QStringLiteral(", ");
+        }
+        candidateCalls += QStringLiteral("read('%1', %2)").arg(QString::fromLatin1(player.appName)).arg(player.durationMultiplier);
+    }
     const QString encodedPreferredArray = QString::fromUtf8(QJsonDocument(QJsonArray{preferredSource}).toJson(QJsonDocument::Compact));
     const QString encodedPreferred = encodedPreferredArray.mid(1, encodedPreferredArray.size() - 2);
-    return runAppleScript(script.arg(encodedPreferred), QStringLiteral("AppleScript"));
+    return runAppleScript(script.arg(encodedPreferred).arg(candidateCalls), QStringLiteral("AppleScript"));
 }
 
 QByteArray readMusicArtworkFallback()
@@ -487,12 +511,10 @@ try {
 
 QByteArray readAppleScriptArtworkFallback(const QString &source)
 {
-    if (source.contains(QLatin1String("Spotify"), Qt::CaseInsensitive)) {
-        return readSpotifyArtworkFallback();
-    }
-
-    if (source.contains(QLatin1String("Music"), Qt::CaseInsensitive)) {
-        return readMusicArtworkFallback();
+    for (const ScriptablePlayer &player : scriptablePlayers) {
+        if (player.artworkReader && source.contains(QLatin1String(player.appName), Qt::CaseInsensitive)) {
+            return player.artworkReader();
+        }
     }
     return {};
 }
